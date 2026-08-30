@@ -25,14 +25,14 @@ console = Console()
 
 @app.command()
 def route(
-    event_name: str = typer.Option(
-        os.getenv("GITHUB_EVENT_NAME", "issues"),
+    event_name: Optional[str] = typer.Option(
+        None,
         "--event-name",
         "-e",
         help="GitHub event name (issues, issue_comment, pull_request)",
     ),
     event_path: Optional[str] = typer.Option(
-        os.getenv("GITHUB_EVENT_PATH"),
+        None,
         "--event-path",
         "-p",
         help="Path to GitHub event JSON file",
@@ -56,10 +56,13 @@ def route(
     ),
 ):
     """Route a GitHub action/webhook event to the appropriate autonomous agent."""
+    resolved_event_name = event_name or os.getenv("GITHUB_EVENT_NAME") or "issues"
+    resolved_event_path = event_path if event_path is not None else os.getenv("GITHUB_EVENT_PATH")
+
     console.print(
         Panel.fit(
             f"[bold cyan]Agentic Fleet Orchestrator[/bold cyan]\n"
-            f"Event: [yellow]{event_name}[/yellow] | Action: [yellow]{event_action}[/yellow] | Dry Run: [magenta]{dry_run}[/magenta]",
+            f"Event: [yellow]{resolved_event_name}[/yellow] | Action: [yellow]{event_action}[/yellow] | Dry Run: [magenta]{dry_run}[/magenta]",
             border_style="cyan",
         )
     )
@@ -75,10 +78,16 @@ def route(
     )
 
     payload = {}
-    if event_path and Path(event_path).exists():
-        payload = router.load_event_payload(event_path)
-    else:
-        # Construct synthetic default payload for CLI testing
+    if resolved_event_path and Path(resolved_event_path).exists():
+        try:
+            loaded_payload = router.load_event_payload(resolved_event_path)
+            if isinstance(loaded_payload, dict) and loaded_payload:
+                payload = loaded_payload
+        except Exception:
+            payload = {}
+
+    # If payload is empty or missing action, supply defaults
+    if not payload:
         payload = {
             "action": event_action,
             "repository": {"full_name": "dipeshsingh2012/rfqengine"},
@@ -94,10 +103,22 @@ def route(
                 "labels": [{"name": "ready-for-qa"}],
             },
         }
+    elif "action" not in payload:
+        payload["action"] = event_action
+
+    # If event_name was explicitly passed on CLI (e.g. issues) but payload lacks issue key
+    if event_name == "issues" and "issue" not in payload:
+        payload["action"] = event_action
+        payload["issue"] = {
+            "number": 42,
+            "title": "Add multi-tenant vector filtering",
+            "body": "Ensure all vector index queries validate tenant isolation.",
+            "labels": [{"name": "agent:pm"}],
+        }
 
     async def _run():
         result = await router.route_event(
-            event_name=event_name,
+            event_name=resolved_event_name,
             payload=payload,
             agent_override=agent,
         )
