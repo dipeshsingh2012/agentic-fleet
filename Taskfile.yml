@@ -1,0 +1,36 @@
+version: '3'
+
+dotenv: ['.env']
+
+tasks:
+  default:
+    desc: "List all available tasks in agentic-fleet"
+    cmds:
+      - task --list
+
+  install:
+    desc: "Install virtual environment and dependencies"
+    cmds:
+      - python3 -m venv .venv
+      - .venv/bin/pip install --upgrade pip
+      - .venv/bin/pip install -r requirements.txt
+
+  test:
+    desc: "Run full pytest automated test suite"
+    cmds:
+      - .venv/bin/pytest -v
+
+  test:unit:
+    desc: "Run quick unit tests"
+    cmds:
+      - .venv/bin/pytest -v -k "not integration"
+
+  dry-run:
+    desc: "Simulate event routing and prompt rendering without live API calls"
+    cmds:
+      - .venv/bin/python -m src.cli --dry-run --event-name issues --event-action opened
+
+  run:
+    desc: "Run the agentic-fleet CLI"
+    cmds:
+      - .venv/bin/python -m src.cli {{.CLI_ARGS}}

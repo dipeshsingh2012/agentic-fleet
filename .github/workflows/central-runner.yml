@@ -1,0 +1,41 @@
+name: Reusable Agentic Fleet Runner
+
+on:
+  workflow_call:
+    inputs:
+      agent-override:
+        description: "Explicit agent override"
+        type: string
+        required: false
+        default: ""
+      dry-run:
+        description: "Dry run mode"
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+      GH_TOKEN:
+        required: true
+
+jobs:
+  agent-fleet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Target Repository
+        uses: actions/checkout@v4
+
+      - name: Checkout Central Agentic Fleet
+        uses: actions/checkout@v4
+        with:
+          repository: dipeshsingh2012/agentic-fleet
+          path: .agentic-fleet
+
+      - name: Run Agentic Fleet Action
+        uses: ./.agentic-fleet
+        with:
+          gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
+          github-token: ${{ secrets.GH_TOKEN }}
+          agent-override: ${{ inputs.agent-override }}
+          dry-run: ${{ inputs.dry-run }}

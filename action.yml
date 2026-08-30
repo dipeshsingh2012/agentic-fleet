@@ -1,0 +1,58 @@
+name: "Autonomous Agentic Fleet Orchestrator"
+description: "Dispatches GitHub events (issues, comments, PRs) to the 5 role-bound autonomous SDLC agents"
+author: "Dipesh Singh"
+
+inputs:
+  gemini-api-key:
+    description: "Google Gemini API Key for LLM reasoning"
+    required: true
+  github-token:
+    description: "GitHub token for reading issues/PRs, posting reviews, adding labels, and merging"
+    required: true
+    default: ${{ github.token }}
+  event-name:
+    description: "GitHub event name (issues, pull_request, issue_comment)"
+    required: false
+    default: ${{ github.event_name }}
+  event-path:
+    description: "Path to GitHub event JSON payload"
+    required: false
+    default: ${{ github.event_path }}
+  agent-override:
+    description: "Explicitly force execution of a specific agent (pm, dev, security, qa, senior-reviewer)"
+    required: false
+    default: ""
+  dry-run:
+    description: "Simulate agent reasoning and actions without posting to GitHub"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Execute Agentic Fleet Orchestrator
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_EVENT_NAME: ${{ inputs.event-name }}
+        GITHUB_EVENT_PATH: ${{ inputs.event-path }}
+      run: |
+        python -m src.cli \
+          --event-name "${{ inputs.event-name }}" \
+          --event-path "${{ inputs.event-path }}" \
+          ${{ inputs.agent-override != '' && format('--agent {0}', inputs.agent-override) || '' }} \
+          ${{ inputs.dry-run == 'true' && '--dry-run' || '' }}
