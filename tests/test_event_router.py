@@ -102,3 +102,26 @@ async def test_route_comment_mentions():
     }
     result = await router.route_event("issue_comment", payload)
     assert result["agent"] == "security-agent"
+
+
+@pytest.mark.asyncio
+async def test_route_autonomous_pipeline():
+    router = EventRouter(dry_run=True)
+    payload = {
+        "action": "opened",
+        "repository": {"full_name": "dipeshsingh2012/rfqengine"},
+        "issue": {
+            "number": 12,
+            "title": "Add Vector Filter",
+            "body": "Need tenant-filtered vector search.",
+            "labels": [{"name": "agent:autonomous"}],
+        },
+    }
+    result = await router.route_event("issues", payload)
+    assert result["pipeline"] == "autonomous-5-agent-sdlc"
+    assert "pm_agent" in result["stages"]
+    assert "dev_agent" in result["stages"]
+    assert "security_agent" in result["stages"]
+    assert "qa_agent" in result["stages"]
+    assert "senior_reviewer_agent" in result["stages"]
+    assert result["status"] == "completed_awaiting_human_merge"
