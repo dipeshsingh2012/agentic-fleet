@@ -122,6 +122,21 @@ jobs:
   agentic-orchestrator:
     name: "Autonomous SDLC Fleet"
     runs-on: ubuntu-latest
+    # Optional: Attach service containers if your test suite requires live DBs
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rfqengine
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Checkout Target Repository
         uses: actions/checkout@v4
