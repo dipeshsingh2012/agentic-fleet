@@ -144,12 +144,29 @@ class GitHubClient:
         body: str,
         event: str = "COMMENT",
     ) -> Dict[str, Any]:
-        """Submit a formal PR review (COMMENT, APPROVE, REQUEST_CHANGES)."""
+        """Submit a PR review (handles GitHub self-review 422 by falling back to COMMENT)."""
         async with self._get_client() as client:
+            payload = {"body": body, "event": event}
             resp = await client.post(
                 f"/repos/{repo}/pulls/{pr_number}/reviews",
-                json={"body": body, "event": event},
+                json=payload,
             )
+
+            # If APPROVE failed with 422 (e.g., GitHub rule: author bot cannot APPROVE own PR)
+            if resp.status_code == 422 and event != "COMMENT":
+                print(f"[WARN] PR review with event '{event}' returned 422 (self-review restriction). Retrying with event='COMMENT'...")
+                payload["event"] = "COMMENT"
+                retry_resp = await client.post(
+                    f"/repos/{repo}/pulls/{pr_number}/reviews",
+                    json=payload,
+                )
+                if retry_resp.status_code in [200, 201]:
+                    return retry_resp.json()
+
+                # If review endpoint still rejects, post directly as a PR comment
+                print(f"[INFO] Fallback to standard PR issue comment...")
+                return await self.create_issue_comment(repo, pr_number, body)
+
             resp.raise_for_status()
             return resp.json()
 
