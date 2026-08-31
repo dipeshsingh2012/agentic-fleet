@@ -149,3 +149,24 @@ def test_add():
     assert (tmp_path / "app" / "services" / "calculator.py").exists()
     assert (tmp_path / "tests" / "test_calculator.py").exists()
     assert "def add(a, b):" in (tmp_path / "app" / "services" / "calculator.py").read_text()
+
+
+def test_agent_context_builder(tmp_path):
+    from src.event_router import AgentContextBuilder
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "Taskfile.yml").write_text("version: 3\n")
+
+    info = AgentContextBuilder.inspect_workspace(tmp_path)
+    assert info["has_backend"] is True
+    assert "Taskfile.yml" in info["key_configs"]
+
+    block = AgentContextBuilder.format_context_block(
+        workspace_info=info,
+        issue_info={"number": 4, "title": "Add CSV Export", "body": "Need streaming export"},
+        review_history="#### 💬 Review by @security-agent: Passed",
+        test_summary={"total": 63, "passed": 63, "failed": 0, "duration": 1.5, "snippet": "63 passed"}
+    )
+    assert "Repository Architecture & Workspace Context" in block
+    assert "Add CSV Export" in block
+    assert "Review by @security-agent" in block
+    assert "63 passed" in block

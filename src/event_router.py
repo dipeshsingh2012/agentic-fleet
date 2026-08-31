@@ -1,6 +1,6 @@
 """
 GitHub event router for multi-agent SDLC lifecycle transitions.
-Supports both single-agent event dispatching, smart code file materialization, and 5-stage SDLC auto-chaining.
+Features 360-degree context awareness, dynamic file materialization, inter-agent review history, and stateful 5-stage SDLC auto-chaining.
 """
 
 from __future__ import annotations
@@ -11,13 +11,116 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from src.github_client import GitHubClient
 from src.llm_runner import LLMRunner
 from src.test_harness import TestHarness
 
 logger = logging.getLogger("agentic-fleet.event_router")
+
+
+class AgentContextBuilder:
+    """Builds a rich, multi-dimensional context snapshot for autonomous agents before taking action."""
+
+    @staticmethod
+    def inspect_workspace(workspace_dir: Path) -> Dict[str, Any]:
+        """Inspect repository structure, framework layout, and configuration files."""
+        has_backend = (workspace_dir / "backend").is_dir()
+        has_frontend = (workspace_dir / "frontend").is_dir()
+        has_extension = (workspace_dir / "extension").is_dir()
+        has_docs = (workspace_dir / "docs").is_dir()
+
+        detected_dirs: List[str] = []
+        if has_backend:
+            detected_dirs.append("`backend/` (FastAPI / Python backend services & unit tests)")
+        if has_frontend:
+            detected_dirs.append("`frontend/` (Web UI application)")
+        if has_extension:
+            detected_dirs.append("`extension/` (Browser Extension)")
+        if has_docs:
+            detected_dirs.append("`docs/` (Architecture Decision Records & PR documentation)")
+
+        key_configs: List[str] = []
+        for config_name in ["Taskfile.yml", "pytest.ini", "pyproject.toml", "package.json", "requirements.txt"]:
+            if (workspace_dir / config_name).exists() or (workspace_dir / "backend" / config_name).exists():
+                key_configs.append(config_name)
+
+        return {
+            "has_backend": has_backend,
+            "has_frontend": has_frontend,
+            "detected_dirs": detected_dirs,
+            "key_configs": key_configs,
+        }
+
+    @staticmethod
+    def format_context_block(
+        workspace_info: Dict[str, Any],
+        issue_info: Dict[str, Any],
+        pr_info: Optional[Dict[str, Any]] = None,
+        review_history: str = "",
+        test_summary: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Render a unified context Markdown block for agent prompts."""
+        blocks: List[str] = []
+
+        # 1. Repository & Architecture Context
+        dirs_str = "\n".join(f"- {d}" for d in workspace_info.get("detected_dirs", [])) or "- Standard single-package layout"
+        configs_str = ", ".join(workspace_info.get("key_configs", [])) or "Standard"
+        has_backend = workspace_info.get("has_backend", False)
+
+        path_directive = (
+            "⚠️ **CRITICAL DIRECTORY DIRECTIVE**: This repository uses a `backend/` workspace. "
+            "All backend source code MUST be placed under `backend/app/` and test files under `backend/tests/`."
+            if has_backend
+            else "Place source files and test files in their standard root directories."
+        )
+
+        blocks.append(
+            f"### 🏗️ Repository Architecture & Workspace Context\n"
+            f"- **Detected Modules**:\n{dirs_str}\n"
+            f"- **Configuration Files**: {configs_str}\n"
+            f"- **Layout Contract**: {path_directive}"
+        )
+
+        # 2. Issue / Requirements Context
+        issue_num = issue_info.get("number", 1)
+        issue_title = issue_info.get("title", "Feature Request")
+        issue_body = issue_info.get("body", "(No description provided)")
+        blocks.append(
+            f"### 🎯 Specification & Requirements (Issue #{issue_num})\n"
+            f"**Title**: {issue_title}\n"
+            f"**Description**:\n{issue_body}"
+        )
+
+        # 3. Pull Request & Git Diff Context
+        if pr_info:
+            pr_num = pr_info.get("number")
+            branch = pr_info.get("branch", "main")
+            diff = pr_info.get("diff", "(No diff available)")
+            blocks.append(
+                f"### 🔀 Pull Request #{pr_num} Context (Branch: `{branch}`)\n"
+                f"```diff\n{diff}\n```"
+            )
+
+        # 4. Inter-Agent Review & Audit History
+        if review_history.strip():
+            blocks.append(review_history.strip())
+
+        # 5. Live Test & Runtime State
+        if test_summary:
+            total = test_summary.get("total", 0)
+            passed = test_summary.get("passed", 0)
+            failed = test_summary.get("failed", 0)
+            duration = test_summary.get("duration", 0.0)
+            snippet = test_summary.get("snippet", "No test logs")
+            blocks.append(
+                f"### 🧪 Live Test Execution Results\n"
+                f"- **Summary**: Total: {total} | Passed: {passed} | Failed: {failed} | Duration: {duration}s\n"
+                f"- **Test Output / Failure Section**:\n```\n{snippet[:2500]}\n```"
+            )
+
+        return "\n\n---\n\n".join(blocks)
 
 
 class EventRouter:
@@ -263,7 +366,8 @@ class EventRouter:
         Smart, stateful SDLC orchestrator with strict QA gate halting and stage skip awareness:
         - Inspects current PR & Issue label states.
         - Skips already-passed stages (PM, Dev, Security, QA).
-        - Executes QA verification first before deciding if dev remediation is genuinely needed.
+        - Ensures workspace is checked out to the current PR branch.
+        - Executes QA verification first against current branch before deciding if dev remediation is needed.
         - Hard Halt: If QA fails (due to test failures, collection/import errors), halts immediately without running senior reviewer!
         """
         print("\n=======================================================")
@@ -295,6 +399,10 @@ class EventRouter:
                 branch_name = pr_data.get("head", {}).get("ref", branch_name)
             except Exception as e:
                 print(f"[WARN] Failed fetching PR metadata: {e}")
+
+        # Ensure runner is on the current PR branch
+        if branch_name:
+            await self._ensure_branch_checkout(repo, branch_name)
 
         pipeline_summary = {
             "pipeline": "autonomous-5-agent-sdlc",
@@ -372,7 +480,7 @@ class EventRouter:
             pipeline_summary["stages"]["qa_agent"] = {"status": "skipped", "verdict": "PASSED"}
             is_qa_failed = False
         else:
-            print(f"\n[STAGE 4/5] 🧪 Running qa-agent for PR #{effective_pr_number}...")
+            print(f"\n[STAGE 4/5] 🧪 Running qa-agent against current branch `{branch_name}` for PR #{effective_pr_number}...")
             qa_result = await self.handle_qa_agent(repo, pr_payload)
             pipeline_summary["stages"]["qa_agent"] = qa_result
 
@@ -448,7 +556,10 @@ class EventRouter:
         return pipeline_summary
 
     async def handle_pm_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """pm-agent: formats user story, Gherkin criteria, and RICE score."""
+        """pm-agent: formats user story, Gherkin criteria, and RICE score with full workspace context."""
+        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
+
         issue = payload.get("issue", {})
         issue_number = issue.get("number", 1)
         issue_title = issue.get("title", "Feature Request")
@@ -458,7 +569,11 @@ class EventRouter:
             "pm-agent",
             {"issue_title": issue_title, "issue_body": issue_body, "repo_name": repo},
         )
-        user_input = f"Issue #{issue_number}: {issue_title}\n\nDescription:\n{issue_body}"
+        context_block = AgentContextBuilder.format_context_block(
+            workspace_info=ws_info,
+            issue_info={"number": issue_number, "title": issue_title, "body": issue_body},
+        )
+        user_input = f"{context_block}\n\nPlease author the user story, Gherkin acceptance criteria, and RICE score for Issue #{issue_number}."
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
         if not self.dry_run and issue_number and repo:
@@ -474,7 +589,10 @@ class EventRouter:
         }
 
     async def handle_dev_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """dev-agent: creates branch, generates code & unit tests, materializes files, drafts/remediates PR."""
+        """dev-agent: creates branch, generates code & unit tests, materializes files with full 360-degree context."""
+        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
+
         pr_number = self._extract_pr_number(payload)
         issue = payload.get("issue", {})
         issue_number = issue.get("number", 1)
@@ -496,28 +614,43 @@ class EventRouter:
             slug = re.sub(r"[^a-z0-9]+", "-", issue_title.lower()).strip("-")[:30] or "feature"
             branch_name = f"feat/{issue_number}-{slug}"
 
+        # Ensure working on target branch
+        if branch_name:
+            await self._ensure_branch_checkout(repo, branch_name)
+
+        review_history = await self._get_pr_reviews_summary(repo, pr_number) if pr_number else ""
+        diff_content = await self._get_pr_diff_safe(repo, effective_num) if is_pr_remediation else ""
+
         prompt = self.llm_runner.load_prompt(
             "dev-agent",
             {"issue_number": effective_num, "issue_title": issue_title, "issue_body": issue_body, "branch_name": branch_name},
         )
 
-        review_history = await self._get_pr_reviews_summary(repo, pr_number) if pr_number else ""
+        context_block = AgentContextBuilder.format_context_block(
+            workspace_info=ws_info,
+            issue_info={"number": effective_num, "title": issue_title, "body": issue_body},
+            pr_info={"number": effective_num, "branch": branch_name, "diff": diff_content} if is_pr_remediation else None,
+            review_history=review_history,
+        )
 
         if is_pr_remediation:
             user_input = (
-                f"Address review and audit feedback on Pull Request #{pr_number} for branch `{branch_name}`.\n\n"
-                f"{review_history}\n\n"
-                f"Latest Reviewer Feedback:\n{comment_body}\n\n"
-                f"Implement all required remediations, place files under backend/app/ and backend/tests/, and output all code blocks using ```python:backend/path/to/file.py."
+                f"{context_block}\n\n"
+                f"### ⚠️ Remediation Task for Pull Request #{pr_number}\n"
+                f"Latest Reviewer / QA Feedback:\n{comment_body}\n\n"
+                f"Implement all required remediations adhering strictly to the directory layout, fix any test issues, and output all code blocks using ```python:backend/path/to/file.py."
             )
         else:
-            user_input = f"Implement specification for Issue #{issue_number}: {issue_title}\n\n{issue_body}\n\nOutput all files in ```python:backend/path/to/file.py blocks."
+            user_input = (
+                f"{context_block}\n\n"
+                f"Implement specification for Issue #{issue_number}: {issue_title}\n\n"
+                f"Output all implementation and test files using ```python:backend/path/to/file.py blocks."
+            )
 
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
         created_pr_number = pr_number
         if not self.dry_run and effective_num and repo:
-            workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
             token = self.github_client.token
 
             # 1. Write docs/prs/ artifact
@@ -601,7 +734,10 @@ class EventRouter:
         }
 
     async def handle_security_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """security-agent: scans diff for multi-tenant isolation, secrets, OWASP."""
+        """security-agent: scans diff for multi-tenant isolation, secrets, OWASP with full context awareness."""
+        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
+
         pr_number = self._extract_pr_number(payload)
         issue_number = payload.get("issue", {}).get("number")
 
@@ -620,15 +756,35 @@ class EventRouter:
             return {"status": "ignored", "reason": "No PR number found for security review"}
 
         effective_pr_number = pr_number or 1
+
+        branch_name = "main"
+        if not self.dry_run and repo:
+            try:
+                pr_info = await self.github_client.get_pull_request(repo, effective_pr_number)
+                branch_name = pr_info.get("head", {}).get("ref", branch_name)
+                if branch_name:
+                    await self._ensure_branch_checkout(repo, branch_name)
+            except Exception:
+                pass
+
         diff_content = await self._get_pr_diff_safe(repo, effective_pr_number)
+        review_history = await self._get_pr_reviews_summary(repo, effective_pr_number)
 
         prompt = self.llm_runner.load_prompt(
             "security-agent",
             {"pr_number": effective_pr_number, "files_inspected": "All modified files in pull request"},
         )
+
+        context_block = AgentContextBuilder.format_context_block(
+            workspace_info=ws_info,
+            issue_info={"number": issue_number or effective_pr_number, "title": f"PR #{effective_pr_number}", "body": "Security Audit"},
+            pr_info={"number": effective_pr_number, "branch": branch_name, "diff": diff_content},
+            review_history=review_history,
+        )
+
         user_input = (
-            f"Perform multi-tenant and secret audit for Pull Request #{effective_pr_number}.\n\n"
-            f"### Code Changes & Git Diff:\n```diff\n{diff_content}\n```"
+            f"{context_block}\n\n"
+            f"Perform multi-tenant isolation, secrets, and OWASP audit for Pull Request #{effective_pr_number}."
         )
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
@@ -650,7 +806,10 @@ class EventRouter:
         }
 
     async def handle_qa_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """qa-agent: executes adversarial tests and full regression suite with accurate metric reporting."""
+        """qa-agent: guarantees execution on the PR's current branch with 360-degree context awareness."""
+        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
+
         pr_number = self._extract_pr_number(payload)
         issue_number = payload.get("issue", {}).get("number")
 
@@ -670,21 +829,21 @@ class EventRouter:
 
         effective_pr_number = pr_number or 1
 
-        # GUARANTEE: Checkout and sync with the PR branch before running tests!
-        if not self.dry_run and repo and pr_number:
+        branch_name = "main"
+        if not self.dry_run and repo:
             try:
                 pr_info = await self.github_client.get_pull_request(repo, effective_pr_number)
-                branch = pr_info.get("head", {}).get("ref")
-                if branch:
-                    await self._ensure_branch_checkout(repo, branch)
+                branch_name = pr_info.get("head", {}).get("ref", branch_name)
+                if branch_name:
+                    await self._ensure_branch_checkout(repo, branch_name)
             except Exception as e:
                 print(f"[WARN] QA branch checkout failed for PR #{effective_pr_number}: {e}")
 
         diff_content = await self._get_pr_diff_safe(repo, effective_pr_number)
+        review_history = await self._get_pr_reviews_summary(repo, effective_pr_number)
 
         # Smart test execution: if backend/ directory exists, run pytest inside backend or target backend/tests
-        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
-        test_cmd = "pytest -v backend/tests" if (workspace_dir / "backend").exists() else "pytest -v"
+        test_cmd = "pytest -v backend/tests" if ws_info.get("has_backend") else "pytest -v"
 
         test_res = await self.test_harness.run_command(test_cmd) if not self.dry_run else None
         if test_res:
@@ -710,12 +869,26 @@ class EventRouter:
                 "execution_time_seconds": duration,
             },
         )
+
+        test_summary = {
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "duration": duration,
+            "snippet": stdout_snippet,
+        }
+
+        context_block = AgentContextBuilder.format_context_block(
+            workspace_info=ws_info,
+            issue_info={"number": issue_number or effective_pr_number, "title": f"PR #{effective_pr_number}", "body": "QA Validation"},
+            pr_info={"number": effective_pr_number, "branch": branch_name, "diff": diff_content},
+            review_history=review_history,
+            test_summary=test_summary,
+        )
+
         user_input = (
-            f"Adversarial QA validation for PR #{effective_pr_number}.\n\n"
-            f"### Automated Test Execution Results ({test_cmd}):\n"
-            f"- Total: {total} | Passed: {passed} | Failed: {failed} | Duration: {duration}s\n"
-            f"- Output:\n```\n{stdout_snippet[:1200]}\n```\n\n"
-            f"### Pull Request Code Diff:\n```diff\n{diff_content}\n```"
+            f"{context_block}\n\n"
+            f"Adversarial QA validation for PR #{effective_pr_number} using command `{test_cmd}`."
         )
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
@@ -737,7 +910,10 @@ class EventRouter:
         }
 
     async def handle_senior_reviewer_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """senior-reviewer-agent: audits architecture/ADRs, checks Sec+QA, approves PR (leaves merge to human)."""
+        """senior-reviewer-agent: audits architecture/ADRs, checks Sec+QA, approves PR with full 360-degree context."""
+        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
+
         pr_number = self._extract_pr_number(payload)
         issue_number = payload.get("issue", {}).get("number")
 
@@ -756,14 +932,32 @@ class EventRouter:
             return {"status": "ignored", "reason": "No PR number found for architectural review"}
 
         effective_pr_number = pr_number or 1
+
+        branch_name = "main"
+        if not self.dry_run and repo:
+            try:
+                pr_info = await self.github_client.get_pull_request(repo, effective_pr_number)
+                branch_name = pr_info.get("head", {}).get("ref", branch_name)
+                if branch_name:
+                    await self._ensure_branch_checkout(repo, branch_name)
+            except Exception:
+                pass
+
         diff_content = await self._get_pr_diff_safe(repo, effective_pr_number)
         review_history = await self._get_pr_reviews_summary(repo, effective_pr_number)
 
         prompt = self.llm_runner.load_prompt("senior-reviewer-agent", {"pr_number": effective_pr_number})
+
+        context_block = AgentContextBuilder.format_context_block(
+            workspace_info=ws_info,
+            issue_info={"number": issue_number or effective_pr_number, "title": f"PR #{effective_pr_number}", "body": "Principal Architect Review"},
+            pr_info={"number": effective_pr_number, "branch": branch_name, "diff": diff_content},
+            review_history=review_history,
+        )
+
         user_input = (
-            f"Principal Architect review and ADR compliance audit for Pull Request #{effective_pr_number}.\n\n"
-            f"{review_history}\n\n"
-            f"### Code Changes & Git Diff:\n```diff\n{diff_content}\n```"
+            f"{context_block}\n\n"
+            f"Principal Architect review, ADR compliance audit, and merge readiness evaluation for Pull Request #{effective_pr_number}."
         )
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
