@@ -166,3 +166,18 @@ agentic-fleet/
 ├── Taskfile.yml                     # Task runner
 └── README.md                        # Documentation & guides
 ```
+
+---
+
+## 🗺️ Roadmap & Future Enhancements
+
+- [ ] **Dedicated Reviewer Token & GitHub App Identity (`REVIEWER_GITHUB_TOKEN`)**
+  - Integrate distinct GitHub App / PAT authentication for `senior-reviewer-agent` to satisfy branch protection rules with formal green `APPROVED` states and prevent self-review limitations.
+- [ ] **Single-Workflow Auto-Chaining (Autonomous Fast-Track)**
+  - Support automatic intra-job handoff (`pm` $\rightarrow$ `dev` $\rightarrow$ `sec` $\rightarrow$ `qa` $\rightarrow$ `reviewer`) in a single workflow run when triggered with `agent:autonomous`.
+- [ ] **Inline Code Review Suggestions**
+  - Equip `security-agent` and `senior-reviewer-agent` to post native GitHub code suggestion blocks (````suggestion ... ````) on specific file diff lines.
+- [ ] **Autonomous Squash & Merge Gate**
+  - Automatically execute squash and merge when all prerequisite quality gates (Security PASSED + QA 100% + Architect APPROVED) are satisfied.
+- [ ] **Multi-Model Hybrid Provider Support**
+  - Add optional fallback support for Vertex AI, Anthropic Claude 3.5 Sonnet, and OpenAI GPT-4o for cross-model consensus reviews.
