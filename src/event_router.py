@@ -220,7 +220,7 @@ class EventRouter:
         Smart, stateful SDLC orchestrator with strict QA gate halting and stage skip awareness:
         - Inspects current PR & Issue label states.
         - Skips already-passed stages (PM, Dev, Security, QA).
-        - Automatically executes pending / remediation steps.
+        - Executes QA verification first before deciding if dev remediation is genuinely needed.
         - Hard Halt: If QA fails (due to test failures, collection/import errors), halts immediately without running senior reviewer!
         """
         print("\n=======================================================")
@@ -324,30 +324,10 @@ class EventRouter:
         # -------------------------------------------------------------
         # STAGE 4: Adversarial QA & Test Execution (qa-agent & dev remediation)
         # -------------------------------------------------------------
-        has_pending_qa_failure = "qa:failed" in pr_labels and not self.dry_run
-
-        if has_pending_qa_failure:
-            print(f"\n[STAGE 4/5] 🧑‍💻 PR #{effective_pr_number} has pending QA findings (qa:failed). Jumping straight to dev-agent remediation...")
-            remediation_payload = {
-                "repository": {"full_name": repo},
-                "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
-                "comment": {"body": "Address previous QA verification and adversarial test findings: ensure code is under backend/app/ and tests under backend/tests/, ensure __init__.py exists, verify chunked CSV streaming generator, and fix pytest collection errors."},
-            }
-            remed_qa_result = await self.handle_dev_agent(repo, remediation_payload)
-            pipeline_summary["stages"]["qa_remediation"] = remed_qa_result
-
-            # Run QA verification on the remediated code
-            print("[STAGE 4.1] 🧪 Running QA verification on newly remediated branch...")
-            qa_result = await self.handle_qa_agent(repo, pr_payload)
-            pipeline_summary["stages"]["qa_agent"] = qa_result
-            qa_response = qa_result.get("response", "")
-            is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
-
-        elif "qa:passed" in pr_labels and not self.dry_run and not is_sec_blocked:
+        if "qa:passed" in pr_labels and not self.dry_run and not is_sec_blocked:
             print(f"[STAGE 4/5] ⏭️ qa-agent: QA verification already passed (qa:passed). Skipping duplicate review.")
             pipeline_summary["stages"]["qa_agent"] = {"status": "skipped", "verdict": "PASSED"}
             is_qa_failed = False
-
         else:
             print(f"\n[STAGE 4/5] 🧪 Running qa-agent for PR #{effective_pr_number}...")
             qa_result = await self.handle_qa_agent(repo, pr_payload)
@@ -357,7 +337,7 @@ class EventRouter:
             is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
 
             if is_qa_failed:
-                print("\n[STAGE 4.1] ⚠️ QA defects / test collection errors detected. Invoking dev-agent to remediate on branch...")
+                print("\n[STAGE 4.1] ⚠️ QA defects / test failures detected. Invoking dev-agent to remediate on branch...")
                 remediation_payload = {
                     "repository": {"full_name": repo},
                     "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
