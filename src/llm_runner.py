@@ -31,7 +31,7 @@ class LLMRunner:
         prompts_dir: Optional[Path] = None,
     ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         self.prompts_dir = prompts_dir or (Path(__file__).parent.parent / "prompts")
 
     def load_prompt(self, agent_name: str, variables: Optional[Dict[str, Any]] = None) -> str:
@@ -71,15 +71,13 @@ class LLMRunner:
                 f"**Simulated Agent Verdict**: STATUS: PASSED / COMPLETED"
             )
 
-        # Build candidate list with gemini-3.5-flash first
+        # Standard Gemini model tiers
         ordered_candidates = [
             self.model,
-            "gemini-3.5-flash",
-            "gemini-3.5-pro",
             "gemini-2.5-flash",
-            "gemini-2.5-pro",
             "gemini-2.0-flash",
             "gemini-1.5-flash",
+            "gemini-2.5-pro",
             "gemini-1.5-pro",
         ]
         candidate_models: List[str] = []
@@ -103,58 +101,56 @@ class LLMRunner:
                         config=config,
                     )
                     if resp.text:
+                        print(f"[LLM] ✅ Successfully generated response using GenAI SDK model: {model_name}")
                         return resp.text
                 except Exception as e:
-                    print(f"[WARN] GenAI SDK model '{model_name}' attempt: {e}")
+                    print(f"[WARN] GenAI SDK model '{model_name}' attempt failed: {e}")
 
-        # Strategy 2: Direct REST across API versions and auth header formats
-        auth_headers_variants = [
-            {"x-goog-api-key": self.api_key},
-            {"Authorization": f"Bearer {self.api_key}"},
-            {},  # Query parameter fallback
-        ]
-
-        api_versions = ["v1beta", "v1"]
+        # Strategy 2: Direct REST with valid Google AI Studio headers and parameters
         last_error = None
 
-        for api_ver in api_versions:
-            for model_name in candidate_models:
-                clean_model = model_name.replace("models/", "")
-                for headers in auth_headers_variants:
-                    url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{clean_model}:generateContent"
-                    if not headers:
-                        url += f"?key={self.api_key}"
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": system_instruction}]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": user_prompt}]
+                }
+            ],
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": 8192,
+            }
+        }
 
-                    payload = {
-                        "system_instruction": {
-                            "parts": [{"text": system_instruction}]
-                        },
-                        "contents": [
-                            {
-                                "role": "user",
-                                "parts": [{"text": user_prompt}]
-                            }
-                        ],
-                        "generationConfig": {
-                            "temperature": temperature,
-                            "maxOutputTokens": 8192,
-                        }
-                    }
+        for model_name in candidate_models:
+            clean_model = model_name.replace("models/", "")
+            urls = [
+                f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={self.api_key}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent",
+            ]
 
-                    req_headers = {"Content-Type": "application/json"}
-                    req_headers.update(headers)
+            for url in urls:
+                headers = {
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": self.api_key,
+                }
 
-                    try:
-                        async with httpx.AsyncClient(timeout=60.0) as client:
-                            resp = await client.post(url, json=payload, headers=req_headers)
-                            if resp.status_code == 200:
-                                data = resp.json()
-                                candidate = data["candidates"][0]
-                                return candidate["content"]["parts"][0]["text"]
-                            else:
-                                last_error = f"HTTP {resp.status_code} on {api_ver}/models/{clean_model}: {resp.text}"
-                                print(f"[WARN] REST {clean_model} ({api_ver}): HTTP {resp.status_code}")
-                    except Exception as e:
-                        last_error = str(e)
+                try:
+                    async with httpx.AsyncClient(timeout=90.0) as client:
+                        resp = await client.post(url, json=payload, headers=headers)
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            candidate = data["candidates"][0]
+                            text = candidate["content"]["parts"][0]["text"]
+                            print(f"[LLM] ✅ Successfully generated response using REST model: {clean_model}")
+                            return text
+                        else:
+                            last_error = f"HTTP {resp.status_code} for {clean_model}: {resp.text}"
+                            print(f"[WARN] REST {clean_model}: HTTP {resp.status_code}")
+                except Exception as e:
+                    last_error = str(e)
 
         raise RuntimeError(f"All Gemini generation attempts failed. Last error: {last_error}")
