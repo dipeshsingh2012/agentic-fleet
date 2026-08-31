@@ -42,6 +42,16 @@ class EventRouter:
             return json.loads(path.read_text(encoding="utf-8"))
         return {}
 
+    def _extract_pr_number(self, payload: Dict[str, Any]) -> Optional[int]:
+        """Safely extract PR number whether event is pull_request or issue_comment on a PR."""
+        if "pull_request" in payload and isinstance(payload["pull_request"], dict):
+            return payload["pull_request"].get("number")
+        # Check if issue_comment is on a pull request
+        issue = payload.get("issue", {})
+        if "pull_request" in issue and isinstance(issue["pull_request"], dict):
+            return issue.get("number")
+        return None
+
     async def route_event(
         self,
         event_name: str,
@@ -68,7 +78,7 @@ class EventRouter:
                 return await self.handle_pm_agent(repo_name, payload)
 
         # 2. Issue Comments / Mentions
-        elif event_name == "issue_comment" and action in ["created", "edited"]:
+        elif event_name in ["issue_comment", "pull_request_review_comment"] and action in ["created", "edited"]:
             comment_body = payload.get("comment", {}).get("body", "").lower()
             if "@dev-agent" in comment_body or "dev-agent" in comment_body or "@dev" in comment_body:
                 return await self.handle_dev_agent(repo_name, payload)
@@ -78,7 +88,7 @@ class EventRouter:
                 return await self.handle_security_agent(repo_name, payload)
             if "@qa-agent" in comment_body or "qa-agent" in comment_body:
                 return await self.handle_qa_agent(repo_name, payload)
-            if "@senior-reviewer-agent" in comment_body or "senior-reviewer" in comment_body:
+            if "@senior-reviewer-agent" in comment_body or "senior-reviewer" in comment_body or "@reviewer" in comment_body:
                 return await self.handle_senior_reviewer_agent(repo_name, payload)
 
         # 3. Pull Request Events
@@ -173,23 +183,23 @@ class EventRouter:
             git_commands = [
                 'git config user.name "github-actions[bot]"',
                 'git config user.email "github-actions[bot]@users.noreply.github.com"',
-                f'git checkout -B {branch_name}',
-                'git add .',
+                f"git checkout -B {branch_name}",
+                "git add .",
                 f'git commit -m "feat(sdlc): implementation for issue #{issue_number} - {issue_title}" --allow-empty',
             ]
             for cmd in git_commands:
                 res = await self.test_harness.run_command(cmd)
                 if not res.is_success and res.exit_code != 0:
-                    logger.error(f"Git command failed: {cmd}\nStdout: {res.stdout}\nStderr: {res.stderr}")
+                    print(f"[ERROR] Git command failed: {cmd}\nStdout: {res.stdout}\nStderr: {res.stderr}")
 
             # Push branch with authenticated remote URL
             push_cmd = f"git push origin {branch_name} --force"
             if token:
                 push_cmd = f"git push https://x-access-token:{token}@github.com/{repo}.git {branch_name} --force"
-            
+
             push_res = await self.test_harness.run_command(push_cmd)
             if not push_res.is_success and push_res.exit_code != 0:
-                logger.error(f"Git push failed: {push_res.stderr} (stdout: {push_res.stdout})")
+                print(f"[ERROR] Git push failed: {push_res.stderr} (stdout: {push_res.stdout})")
 
             # 3. Create Pull Request via GitHub API
             try:
@@ -202,9 +212,9 @@ class EventRouter:
                 )
                 pr_number = pr_res.get("number")
             except Exception as e:
-                logger.error(f"Create PR error: {e}")
+                print(f"[ERROR] Create PR error: {e}")
 
-            # 4. Add labels and post ONLY a clean link to the issue (NO PR content dump)
+            # 4. Add labels and post clean update to the issue
             if pr_number:
                 await self.github_client.add_labels(repo, pr_number, ["ready-for-security-audit"])
                 comment_body = (
@@ -232,15 +242,32 @@ class EventRouter:
 
     async def handle_security_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """security-agent: scans diff for multi-tenant isolation, secrets, OWASP."""
-        pr = payload.get("pull_request", {})
-        pr_number = pr.get("number", 1)
+        pr_number = self._extract_pr_number(payload)
+        issue_number = payload.get("issue", {}).get("number")
+
+        # If triggered on an issue without PR, try finding existing PR for that issue's branch
+        if not pr_number and issue_number and not self.dry_run:
+            existing_pr = await self.github_client.find_existing_pr(repo, f"feat/{issue_number}")
+            if existing_pr:
+                pr_number = existing_pr.get("number")
+
+        if not pr_number and not self.dry_run:
+            if issue_number:
+                await self.github_client.create_issue_comment(
+                    repo,
+                    issue_number,
+                    "⚠️ `security-agent`: No active Pull Request found for this issue. Please run `@dev-agent` first to create the implementation branch and PR.",
+                )
+            return {"status": "ignored", "reason": "No PR number found for security review"}
+
+        effective_pr_number = pr_number or 1
         files_inspected = "All modified files in pull request"
 
         prompt = self.llm_runner.load_prompt(
             "security-agent",
-            {"pr_number": pr_number, "files_inspected": files_inspected},
+            {"pr_number": effective_pr_number, "files_inspected": files_inspected},
         )
-        user_input = f"Perform multi-tenant and secret audit for PR #{pr_number}"
+        user_input = f"Perform multi-tenant and secret audit for PR #{effective_pr_number}"
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
         if not self.dry_run and pr_number and repo:
@@ -250,14 +277,30 @@ class EventRouter:
         return {
             "agent": "security-agent",
             "action": "security_audit",
-            "pr_number": pr_number,
+            "pr_number": effective_pr_number,
             "response": response,
         }
 
     async def handle_qa_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """qa-agent: executes adversarial tests and full regression suite."""
-        pr = payload.get("pull_request", {})
-        pr_number = pr.get("number", 1)
+        pr_number = self._extract_pr_number(payload)
+        issue_number = payload.get("issue", {}).get("number")
+
+        if not pr_number and issue_number and not self.dry_run:
+            existing_pr = await self.github_client.find_existing_pr(repo, f"feat/{issue_number}")
+            if existing_pr:
+                pr_number = existing_pr.get("number")
+
+        if not pr_number and not self.dry_run:
+            if issue_number:
+                await self.github_client.create_issue_comment(
+                    repo,
+                    issue_number,
+                    "⚠️ `qa-agent`: No active Pull Request found for this issue. Please run `@dev-agent` first to create the implementation branch and PR.",
+                )
+            return {"status": "ignored", "reason": "No PR number found for QA testing"}
+
+        effective_pr_number = pr_number or 1
 
         # Run test harness
         test_res = await self.test_harness.run_command("pytest -v") if not self.dry_run else None
@@ -269,14 +312,14 @@ class EventRouter:
         prompt = self.llm_runner.load_prompt(
             "qa-agent",
             {
-                "pr_number": pr_number,
+                "pr_number": effective_pr_number,
                 "total_tests": total,
                 "passed_tests": passed,
                 "failed_tests": failed,
                 "execution_time_seconds": duration,
             },
         )
-        user_input = f"Adversarial QA validation for PR #{pr_number}. Total: {total}, Passed: {passed}"
+        user_input = f"Adversarial QA validation for PR #{effective_pr_number}. Total: {total}, Passed: {passed}"
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
         if not self.dry_run and pr_number and repo:
@@ -286,17 +329,33 @@ class EventRouter:
         return {
             "agent": "qa-agent",
             "action": "qa_verification",
-            "pr_number": pr_number,
+            "pr_number": effective_pr_number,
             "response": response,
         }
 
     async def handle_senior_reviewer_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """senior-reviewer-agent: audits architecture/ADRs, checks Sec+QA, approves PR."""
-        pr = payload.get("pull_request", {})
-        pr_number = pr.get("number", 1)
+        pr_number = self._extract_pr_number(payload)
+        issue_number = payload.get("issue", {}).get("number")
 
-        prompt = self.llm_runner.load_prompt("senior-reviewer-agent", {"pr_number": pr_number})
-        user_input = f"Principal Architect review and ADR compliance audit for PR #{pr_number}"
+        if not pr_number and issue_number and not self.dry_run:
+            existing_pr = await self.github_client.find_existing_pr(repo, f"feat/{issue_number}")
+            if existing_pr:
+                pr_number = existing_pr.get("number")
+
+        if not pr_number and not self.dry_run:
+            if issue_number:
+                await self.github_client.create_issue_comment(
+                    repo,
+                    issue_number,
+                    "⚠️ `senior-reviewer-agent`: No active Pull Request found for this issue. Please run `@dev-agent` first to create the implementation branch and PR.",
+                )
+            return {"status": "ignored", "reason": "No PR number found for architectural review"}
+
+        effective_pr_number = pr_number or 1
+
+        prompt = self.llm_runner.load_prompt("senior-reviewer-agent", {"pr_number": effective_pr_number})
+        user_input = f"Principal Architect review and ADR compliance audit for PR #{effective_pr_number}"
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
         if not self.dry_run and pr_number and repo:
@@ -306,6 +365,6 @@ class EventRouter:
         return {
             "agent": "senior-reviewer-agent",
             "action": "architect_review_approval",
-            "pr_number": pr_number,
+            "pr_number": effective_pr_number,
             "response": response,
         }
