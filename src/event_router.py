@@ -1,6 +1,6 @@
 """
 GitHub event router for multi-agent SDLC lifecycle transitions.
-Supports both single-agent event dispatching and smart stateful 5-stage SDLC auto-chaining.
+Supports both single-agent event dispatching and smart stateful 5-stage SDLC auto-chaining with hard QA gates.
 """
 
 from __future__ import annotations
@@ -153,15 +153,14 @@ class EventRouter:
 
     async def run_autonomous_pipeline(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Smart, stateful SDLC orchestrator:
+        Smart, stateful SDLC orchestrator with strict QA gate halting:
         - Inspects current PR & Issue label states.
         - Automatically drives pending / review / remediation steps forward.
-        - Executes remediation loop if QA or Security flagged defects.
-        - Delivers final architectural sign-off (leaving merge to human).
+        - Hard Halt: If QA fails (due to test failures, collection/import errors), halts immediately without running senior reviewer!
         """
         print("\n=======================================================")
         print("🛸 SMART AGENTIC FLEET PIPELINE (Autonomous Orchestration)")
-        print("=======================================================\n")
+        print("=======================================================\\n")
 
         issue_payload = payload.get("issue", {})
         issue_number = issue_payload.get("number", 1)
@@ -263,11 +262,11 @@ class EventRouter:
         is_qa_failed = "STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "FAIL ❌" in qa_response or "CRITICAL" in qa_response
 
         if is_qa_failed:
-            print("\n[STAGE 4.1] ⚠️ QA defects detected. Invoking dev-agent to remediate on branch...")
+            print("\n[STAGE 4.1] ⚠️ QA defects / test collection errors detected. Invoking dev-agent to remediate on branch...")
             remediation_payload = {
                 "repository": {"full_name": repo},
                 "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
-                "comment": {"body": f"Please fix the following QA defects and adversarial test failures:\n\n{qa_response}"},
+                "comment": {"body": f"Please fix the following QA defects, test collection errors, and adversarial failures:\n\n{qa_response}"},
             }
             remed_qa_result = await self.handle_dev_agent(repo, remediation_payload)
             pipeline_summary["stages"]["qa_remediation"] = remed_qa_result
@@ -278,45 +277,49 @@ class EventRouter:
             qa_response = qa_result.get("response", "")
             is_qa_failed = "STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "FAIL ❌" in qa_response
 
+        # HARD GATE: If QA failed due to collection errors or test failures, HALT PIPELINE IMMEDIATELY!
+        if is_qa_failed:
+            print("\n[HALT] 🛑 QA verification failed (test collection/execution/edge case error). Halting pipeline before Senior Reviewer.")
+            pipeline_summary["status"] = "qa_failed_halted"
+            if not self.dry_run and pr_number and repo:
+                await self.github_client.add_labels(repo, pr_number, ["qa:failed", "status:changes-requested"])
+                halt_comment = (
+                    f"## 🛑 Autonomous Pipeline Halted: QA Test Execution / Collection Failed\n\n"
+                    f"- 🎯 **`pm-agent`**: Specification accepted.\n"
+                    f"- 🧑‍💻 **`dev-agent`**: Implementation pushed to `{branch_name}`.\n"
+                    f"- 🛡️ **`security-agent`**: Security audit complete.\n"
+                    f"- 🧪 **`qa-agent`**: **STATUS: FAILED ❌** (Test collection or execution errors detected).\n\n"
+                    f"⛔ **Pipeline Halted**: `senior-reviewer-agent` will not run until all test errors and collection issues are resolved.\n\n"
+                    f"👉 Please inspect and resolve failures on Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number})."
+                )
+                await self.github_client.create_issue_comment(repo, issue_number, halt_comment)
+            return pipeline_summary
+
         # -------------------------------------------------------------
         # STAGE 5: Principal Architect Review & Sign-off (senior-reviewer-agent)
         # -------------------------------------------------------------
         print(f"\n[STAGE 5/5] 🧙‍♂️ Running senior-reviewer-agent (ADR Audit & Approval)...")
         reviewer_result = await self.handle_senior_reviewer_agent(repo, pr_payload)
         pipeline_summary["stages"]["senior_reviewer_agent"] = reviewer_result
-        all_passed = (not is_sec_blocked) and (not is_qa_failed)
 
         sec_status_icon = "STATUS: BLOCKED ❌" if is_sec_blocked else "STATUS: PASSED ✅"
-        qa_status_icon = "STATUS: FAILED ❌" if is_qa_failed else "STATUS: PASSED ✅"
+        qa_status_icon = "STATUS: PASSED ✅"
 
         if not self.dry_run and pr_number and repo:
-            if all_passed:
-                await self.github_client.add_labels(repo, pr_number, ["ready-for-merge", "status:approved"])
-                final_comment = (
-                    f"## 🚀 Autonomous 5-Agent SDLC Pipeline: Ready for Merge\n\n"
-                    f"All quality and compliance gates are verified:\n"
-                    f"- 🎯 **`pm-agent`**: User Story & Gherkin specifications accepted.\n"
-                    f"- 🧑‍💻 **`dev-agent`**: Code and unit tests authored on branch `{branch_name}`.\n"
-                    f"- 🛡️ **`security-agent`**: Multi-tenant isolation & secrets audit ({sec_status_icon}).\n"
-                    f"- 🧪 **`qa-agent`**: Adversarial edge cases & regression tests ({qa_status_icon}).\n"
-                    f"- 🧙‍♂️ **`senior-reviewer-agent`**: ADR compliance validated and PR **APPROVED (`LGTM ✅`)**.\n\n"
-                    f"👉 **Human Sign-Off Gate**: Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number}) is ready for your final merge!"
-                )
-            else:
-                await self.github_client.add_labels(repo, pr_number, ["status:changes-requested"])
-                final_comment = (
-                    f"## ⚠️ Autonomous SDLC Pipeline: Quality Gate Action Required\n\n"
-                    f"- 🎯 **`pm-agent`**: Specification accepted.\n"
-                    f"- 🧑‍💻 **`dev-agent`**: Code pushed to branch `{branch_name}`.\n"
-                    f"- 🛡️ **`security-agent`**: {sec_status_icon}.\n"
-                    f"- 🧪 **`qa-agent`**: {qa_status_icon}.\n"
-                    f"- 🧙‍♂️ **`senior-reviewer-agent`**: Review pending defect resolution.\n\n"
-                    f"👉 **Action Required**: Please inspect findings on Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number})."
-                )
-
+            await self.github_client.add_labels(repo, pr_number, ["ready-for-merge", "status:approved"])
+            final_comment = (
+                f"## 🚀 Autonomous 5-Agent SDLC Pipeline: Ready for Merge\n\n"
+                f"All quality and compliance gates are verified:\n"
+                f"- 🎯 **`pm-agent`**: User Story & Gherkin specifications accepted.\n"
+                f"- 🧑‍💻 **`dev-agent`**: Code and unit tests authored on branch `{branch_name}`.\n"
+                f"- 🛡️ **`security-agent`**: Multi-tenant isolation & secrets audit ({sec_status_icon}).\n"
+                f"- 🧪 **`qa-agent`**: Adversarial edge cases & regression tests ({qa_status_icon}).\n"
+                f"- 🧙‍♂️ **`senior-reviewer-agent`**: ADR compliance validated and PR **APPROVED (`LGTM ✅`)**.\n\n"
+                f"👉 **Human Sign-Off Gate**: Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number}) is ready for your final merge!"
+            )
             await self.github_client.create_issue_comment(repo, issue_number, final_comment)
 
-        pipeline_summary["status"] = "completed_awaiting_human_merge" if all_passed else "action_required"
+        pipeline_summary["status"] = "completed_awaiting_human_merge"
         print("\n=======================================================")
         print(f"🏁 STATEFUL PIPELINE EXECUTION COMPLETE (Status: {pipeline_summary['status']})")
         print("=======================================================\\n")
@@ -380,7 +383,7 @@ class EventRouter:
             user_input = (
                 f"Address review and audit feedback on Pull Request #{pr_number} for branch `{branch_name}`.\n\n"
                 f"Reviewer Feedback:\n{comment_body}\n\n"
-                f"Implement all required remediations, tenant isolation checks, and update tests."
+                f"Implement all required remediations, fix any test collection/syntax errors, and update tests."
             )
         else:
             user_input = f"Implement specification for Issue #{issue_number}: {issue_title}\n\n{issue_body}"
@@ -559,7 +562,7 @@ class EventRouter:
             f"Adversarial QA validation for PR #{effective_pr_number}.\n\n"
             f"### Automated Test Execution Results:\n"
             f"- Total: {total} | Passed: {passed} | Failed: {failed} | Duration: {duration}s\n"
-            f"- Output: {stdout_snippet[:500]}\n\n"
+            f"- Output:\n```\n{stdout_snippet[:800]}\n```\n\n"
             f"### Pull Request Code Diff:\n```diff\n{diff_content}\n```"
         )
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)

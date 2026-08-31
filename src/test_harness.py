@@ -27,6 +27,8 @@ class TestResult:
 
     @property
     def is_success(self) -> bool:
+        # Exit code 0 means clean execution and all passed
+        # Exit code 5 in pytest means no tests found/collected (neutral only if exit code 0)
         return self.exit_code == 0 and self.failed_tests == 0
 
 
@@ -69,9 +71,15 @@ class TestHarness:
 
         total, passed, failed, skipped = self._parse_pytest_counts(stdout + "\n" + stderr)
 
+        # If pytest exit code is non-zero (e.g. collection error or test failure), ensure failed count is at least 1
+        exit_code = process.returncode if process.returncode is not None else 0
+        if exit_code not in [0, 5] and failed == 0:
+            failed = 1
+            total = max(total, passed + failed)
+
         return TestResult(
             command=command,
-            exit_code=process.returncode or 0,
+            exit_code=exit_code,
             duration_seconds=duration,
             stdout=stdout,
             stderr=stderr,
@@ -94,6 +102,10 @@ class TestHarness:
         failed_match = re.search(r"(\d+)\s+failed", output, re.IGNORECASE)
         if failed_match:
             failed = int(failed_match.group(1))
+
+        errors_match = re.search(r"(\d+)\s+errors?", output, re.IGNORECASE)
+        if errors_match:
+            failed += int(errors_match.group(1))
 
         skipped_match = re.search(r"(\d+)\s+skipped", output, re.IGNORECASE)
         if skipped_match:
