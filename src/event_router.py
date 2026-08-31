@@ -677,6 +677,28 @@ class EventRouter:
             extracted_files = self._materialize_code_files(workspace_dir, response)
             print(f"[DEV-AGENT] 🚀 Materialized {len(extracted_files)} files: {list(extracted_files.keys())}")
 
+            # 3. Pre-Commit Self-Healing Sandbox Loop: verify locally before pushing!
+            test_cmd = "pytest -v backend/tests" if ws_info.get("has_backend") else "pytest -v"
+            for iteration in range(1, 4):
+                print(f"[DEV-AGENT] 🧪 Running pre-commit test verification (Iteration {iteration}/3)...")
+                test_res = await self.test_harness.run_command(test_cmd)
+                if test_res.is_success or test_res.failed_tests == 0:
+                    print(f"[DEV-AGENT] ✅ Pre-commit test suite PASSED ({test_res.passed_tests} passed, 0 failures)!")
+                    break
+                else:
+                    print(f"[DEV-AGENT] ⚠️ Pre-commit test failure detected ({test_res.failed_tests} failed). Auto-remediating locally...")
+                    fix_input = (
+                        f"Your previously generated code caused test failures or collection errors:\n\n"
+                        f"### Test Command: {test_cmd}\n"
+                        f"### Error Traceback:\n```\n{test_res.failure_summary}\n```\n\n"
+                        f"Please fix all missing imports (e.g. from typing import AsyncGenerator, etc.), missing functions, and test errors.\n"
+                        f"Output all corrected files in ```python:backend/path/to/file.py blocks."
+                    )
+                    fix_response = await self.llm_runner.generate_response(prompt, fix_input, dry_run=self.dry_run)
+                    re_extracted = self._materialize_code_files(workspace_dir, fix_response)
+                    extracted_files.update(re_extracted)
+                    response += "\n\n" + fix_response
+
             commit_msg = (
                 f"fix(sdlc): remediate review findings and materialize source files on PR #{pr_number}"
                 if is_pr_remediation
