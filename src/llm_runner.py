@@ -31,7 +31,7 @@ class LLMRunner:
         prompts_dir: Optional[Path] = None,
     ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
         self.prompts_dir = prompts_dir or (Path(__file__).parent.parent / "prompts")
 
     def load_prompt(self, agent_name: str, variables: Optional[Dict[str, Any]] = None) -> str:
@@ -72,7 +72,7 @@ class LLMRunner:
             )
 
         candidate_models = [self.model]
-        for m in ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"]:
+        for m in ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]:
             if m not in candidate_models:
                 candidate_models.append(m)
 
