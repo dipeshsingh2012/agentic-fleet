@@ -1,5 +1,5 @@
 """
-Test harness for running and evaluating automated test suites.
+Test harness for running and evaluating automated test suites with automatic PYTHONPATH configuration.
 """
 
 from __future__ import annotations
@@ -42,9 +42,22 @@ class TestHarness:
     async def run_command(self, command: str, timeout: float = 300.0) -> TestResult:
         """Execute a test or lint command and parse standard metrics."""
         start_time = time.time()
+
+        # Configure environment with automatic PYTHONPATH resolution for target repos and subfolders (e.g. backend/)
+        env = os.environ.copy()
+        target_ws = os.getenv("TARGET_WORKSPACE", self.cwd)
+        extra_paths = [target_ws]
+        backend_dir = os.path.join(target_ws, "backend")
+        if os.path.isdir(backend_dir):
+            extra_paths.append(backend_dir)
+
+        current_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = ":".join(extra_paths) + (f":{current_pythonpath}" if current_pythonpath else "")
+
         process = await asyncio.create_subprocess_shell(
             command,
             cwd=self.cwd,
+            env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
