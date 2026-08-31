@@ -31,7 +31,7 @@ class LLMRunner:
         prompts_dir: Optional[Path] = None,
     ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
         self.prompts_dir = prompts_dir or (Path(__file__).parent.parent / "prompts")
 
     def load_prompt(self, agent_name: str, variables: Optional[Dict[str, Any]] = None) -> str:
@@ -71,18 +71,18 @@ class LLMRunner:
                 f"**Simulated Agent Verdict**: STATUS: PASSED / COMPLETED"
             )
 
-        # Build candidate list with primary model first
+        # Build candidate list with gemini-3.5-flash first
         ordered_candidates = [
             self.model,
+            "gemini-3.5-flash",
+            "gemini-3.5-pro",
             "gemini-2.5-flash",
+            "gemini-2.5-pro",
             "gemini-2.0-flash",
             "gemini-1.5-flash",
-            "gemini-1.5-flash-latest",
-            "gemini-2.5-pro",
             "gemini-1.5-pro",
-            "gemini-1.5-pro-latest",
         ]
-        candidate_models = []
+        candidate_models: List[str] = []
         for m in ordered_candidates:
             if m and m not in candidate_models:
                 candidate_models.append(m)
@@ -105,7 +105,7 @@ class LLMRunner:
                     if resp.text:
                         return resp.text
                 except Exception as e:
-                    print(f"[INFO] GenAI SDK model '{model_name}' attempt failed: {e}. Trying next candidate...")
+                    print(f"[WARN] GenAI SDK model '{model_name}' attempt: {e}")
 
         # Strategy 2: Direct REST across API versions and auth header formats
         auth_headers_variants = [
@@ -119,7 +119,6 @@ class LLMRunner:
 
         for api_ver in api_versions:
             for model_name in candidate_models:
-                # Strip models/ prefix if present
                 clean_model = model_name.replace("models/", "")
                 for headers in auth_headers_variants:
                     url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{clean_model}:generateContent"
@@ -154,6 +153,7 @@ class LLMRunner:
                                 return candidate["content"]["parts"][0]["text"]
                             else:
                                 last_error = f"HTTP {resp.status_code} on {api_ver}/models/{clean_model}: {resp.text}"
+                                print(f"[WARN] REST {clean_model} ({api_ver}): HTTP {resp.status_code}")
                     except Exception as e:
                         last_error = str(e)
 
