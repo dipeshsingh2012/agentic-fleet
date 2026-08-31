@@ -1,5 +1,6 @@
 """
 LLM execution runner for dispatching tasks to Gemini models via Google GenAI SDK and REST fallback.
+Includes dynamic model discovery to automatically query active Google AI Studio models and filter deprecated versions.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ class LLMRunner:
         self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
         self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         self.prompts_dir = prompts_dir or (Path(__file__).parent.parent / "prompts")
+        self._discovered_models: Optional[List[str]] = None
 
     def load_prompt(self, agent_name: str, variables: Optional[Dict[str, Any]] = None) -> str:
         """Load and render an agent system prompt template with variable substitution."""
@@ -55,6 +57,48 @@ class LLMRunner:
 
         return content
 
+    async def discover_active_models(self) -> List[str]:
+        """Query Google API for the list of currently active and supported generateContent models."""
+        if self._discovered_models:
+            return self._discovered_models
+
+        discovered: List[str] = []
+        if self.api_key:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models?key={self.api_key}"
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    resp = await client.get(url, headers={"x-goog-api-key": self.api_key})
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        for item in data.get("models", []):
+                            methods = item.get("supportedGenerationMethods", [])
+                            name = item.get("name", "").replace("models/", "")
+                            # Filter out deprecated 1.0 / 1.5 models and ensure generateContent is supported
+                            if "generateContent" in methods and not name.startswith("gemini-1.") and not name.startswith("text-embedding"):
+                                discovered.append(name)
+                        print(f"[LLM] 🔍 Discovered {len(discovered)} active models from Google API: {discovered[:5]}")
+            except Exception as e:
+                print(f"[WARN] Dynamic model discovery failed: {e}")
+
+        # Built-in modern fallback candidates (excluding deprecated 1.5)
+        defaults = [
+            self.model,
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash-lite",
+            "gemini-2.0-pro-exp",
+        ]
+        
+        final_list: List[str] = []
+        for m in (discovered or defaults):
+            clean = m.replace("models/", "")
+            if clean and clean not in final_list and not clean.startswith("gemini-1."):
+                final_list.append(clean)
+
+        self._discovered_models = final_list
+        return final_list
+
     async def generate_response(
         self,
         system_instruction: str,
@@ -71,19 +115,8 @@ class LLMRunner:
                 f"**Simulated Agent Verdict**: STATUS: PASSED / COMPLETED"
             )
 
-        # Standard Gemini model tiers
-        ordered_candidates = [
-            self.model,
-            "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-            "gemini-2.5-pro",
-            "gemini-1.5-pro",
-        ]
-        candidate_models: List[str] = []
-        for m in ordered_candidates:
-            if m and m not in candidate_models:
-                candidate_models.append(m)
+        candidate_models = await self.discover_active_models()
+        print(f"[LLM] 🚀 Attempting generation with candidate models: {candidate_models}")
 
         # Strategy 1: Official Google GenAI SDK
         if HAS_GENAI_SDK:
