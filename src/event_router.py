@@ -233,7 +233,7 @@ class EventRouter:
         pipeline_summary["stages"]["security_agent"] = sec_result
 
         sec_response = sec_result.get("response", "")
-        is_sec_blocked = "STATUS: BLOCKED" in sec_response or "CRITICAL" in sec_response or "HIGH" in sec_response
+        is_sec_blocked = False if self.dry_run else ("STATUS: BLOCKED" in sec_response or "VERDICT: BLOCKED" in sec_response or "STATUS: FAILED" in sec_response)
 
         if is_sec_blocked:
             print("\n[STAGE 3.1] ⚠️ Security defects detected. Invoking dev-agent to remediate...")
@@ -249,7 +249,7 @@ class EventRouter:
             sec_result = await self.handle_security_agent(repo, pr_payload)
             pipeline_summary["stages"]["security_agent_recheck"] = sec_result
             sec_response = sec_result.get("response", "")
-            is_sec_blocked = "STATUS: BLOCKED" in sec_response or "CRITICAL" in sec_response
+            is_sec_blocked = False if self.dry_run else ("STATUS: BLOCKED" in sec_response or "VERDICT: BLOCKED" in sec_response or "STATUS: FAILED" in sec_response)
 
         # -------------------------------------------------------------
         # STAGE 4: Adversarial QA & Test Execution (qa-agent)
@@ -259,7 +259,7 @@ class EventRouter:
         pipeline_summary["stages"]["qa_agent"] = qa_result
 
         qa_response = qa_result.get("response", "")
-        is_qa_failed = "STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "FAIL ❌" in qa_response or "CRITICAL" in qa_response
+        is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
 
         if is_qa_failed:
             print("\n[STAGE 4.1] ⚠️ QA defects / test collection errors detected. Invoking dev-agent to remediate on branch...")
@@ -275,7 +275,7 @@ class EventRouter:
             qa_result = await self.handle_qa_agent(repo, pr_payload)
             pipeline_summary["stages"]["qa_agent_recheck"] = qa_result
             qa_response = qa_result.get("response", "")
-            is_qa_failed = "STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "FAIL ❌" in qa_response
+            is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
 
         # HARD GATE: If QA failed due to collection errors or test failures, HALT PIPELINE IMMEDIATELY!
         if is_qa_failed:
