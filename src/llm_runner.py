@@ -1,14 +1,24 @@
 """
-LLM execution runner for dispatching tasks to Gemini models.
+LLM execution runner for dispatching tasks to Gemini models via Google GenAI SDK and REST fallback.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import httpx
+
+try:
+    from google import genai
+    from google.genai import types
+    HAS_GENAI_SDK = True
+except ImportError:
+    HAS_GENAI_SDK = False
+
+logger = logging.getLogger("agentic-fleet.llm_runner")
 
 
 class LLMRunner:
@@ -30,7 +40,6 @@ class LLMRunner:
         prompt_path = self.prompts_dir / prompt_filename
 
         if not prompt_path.exists():
-            # Try alternate naming (e.g. senior-reviewer -> senior-reviewer-agent)
             prompt_filename = f"{agent_name}-agent.prompt.md"
             prompt_path = self.prompts_dir / prompt_filename
 
@@ -53,7 +62,7 @@ class LLMRunner:
         temperature: float = 0.2,
         dry_run: bool = False,
     ) -> str:
-        """Generate response from Gemini API with automatic model fallbacks."""
+        """Generate response from Gemini API using Google GenAI SDK with REST fallback."""
         if dry_run or not self.api_key:
             return (
                 f"### [DRY RUN / MOCK MODE]\n\n"
@@ -62,50 +71,74 @@ class LLMRunner:
                 f"**Simulated Agent Verdict**: STATUS: PASSED / COMPLETED"
             )
 
-        models_to_try = [self.model]
-        for fallback in ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash"]:
-            if fallback not in models_to_try:
-                models_to_try.append(fallback)
+        candidate_models = [self.model]
+        for m in ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"]:
+            if m not in candidate_models:
+                candidate_models.append(m)
+
+        # Strategy 1: Official Google GenAI SDK
+        if HAS_GENAI_SDK:
+            for model_name in candidate_models:
+                try:
+                    client = genai.Client(api_key=self.api_key)
+                    config = types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=temperature,
+                        max_output_tokens=8192,
+                    )
+                    resp = await client.aio.models.generate_content(
+                        model=model_name,
+                        contents=user_prompt,
+                        config=config,
+                    )
+                    if resp.text:
+                        return resp.text
+                except Exception as e:
+                    logger.debug(f"SDK attempt with {model_name} failed: {e}")
+
+        # Strategy 2: Direct REST with Header-based Authentication (x-goog-api-key & Bearer)
+        auth_headers_variants = [
+            {"x-goog-api-key": self.api_key},
+            {"Authorization": f"Bearer {self.api_key}"},
+            {},  # Query param fallback
+        ]
 
         last_error = None
-        for model_name in models_to_try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.api_key}"
-            payload = {
-                "system_instruction": {
-                    "parts": [{"text": system_instruction}]
-                },
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [{"text": user_prompt}]
+        for model_name in candidate_models:
+            for headers in auth_headers_variants:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+                if not headers:
+                    url += f"?key={self.api_key}"
+
+                payload = {
+                    "system_instruction": {
+                        "parts": [{"text": system_instruction}]
+                    },
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [{"text": user_prompt}]
+                        }
+                    ],
+                    "generationConfig": {
+                        "temperature": temperature,
+                        "maxOutputTokens": 8192,
                     }
-                ],
-                "generationConfig": {
-                    "temperature": temperature,
-                    "maxOutputTokens": 8192,
                 }
-            }
 
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    resp = await client.post(url, json=payload)
-                    if resp.status_code == 404:
-                        # Model not found or unsupported on endpoint, try next fallback
-                        last_error = f"Model {model_name} returned 404 Not Found"
-                        continue
-                    resp.raise_for_status()
-                    data = resp.json()
+                req_headers = {"Content-Type": "application/json"}
+                req_headers.update(headers)
 
-                    candidate = data["candidates"][0]
-                    text = candidate["content"]["parts"][0]["text"]
-                    return text
-            except httpx.HTTPStatusError as e:
-                last_error = f"HTTP {e.response.status_code}: {e.response.text}"
-                if e.response.status_code == 404:
-                    continue
-                raise
-            except Exception as e:
-                last_error = str(e)
-                continue
+                try:
+                    async with httpx.AsyncClient(timeout=60.0) as client:
+                        resp = await client.post(url, json=payload, headers=req_headers)
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            candidate = data["candidates"][0]
+                            return candidate["content"]["parts"][0]["text"]
+                        else:
+                            last_error = f"HTTP {resp.status_code} for {model_name}: {resp.text}"
+                except Exception as e:
+                    last_error = str(e)
 
-        raise RuntimeError(f"All Gemini model attempts failed. Last error: {last_error}")
+        raise RuntimeError(f"All Gemini generation attempts failed. Last error: {last_error}")
