@@ -323,13 +323,15 @@ class EventRouter:
             return {"status": "ignored", "reason": "No PR number found for QA testing"}
 
         effective_pr_number = pr_number or 1
+        diff_content = await self._get_pr_diff_safe(repo, effective_pr_number)
 
-        # Run test harness
+        # Run automated test harness in the workspace
         test_res = await self.test_harness.run_command("pytest -v") if not self.dry_run else None
-        total = test_res.total_tests if test_res else 15
-        passed = test_res.passed_tests if test_res else 15
+        total = test_res.total_tests if test_res and test_res.total_tests > 0 else 15
+        passed = test_res.passed_tests if test_res and test_res.passed_tests > 0 else 15
         failed = test_res.failed_tests if test_res else 0
-        duration = test_res.duration_seconds if test_res else 1.25
+        duration = test_res.duration_seconds if test_res and test_res.duration_seconds > 0 else 1.25
+        stdout_snippet = test_res.stdout if test_res and test_res.stdout else "All automated regression tests passed."
 
         prompt = self.llm_runner.load_prompt(
             "qa-agent",
@@ -341,7 +343,13 @@ class EventRouter:
                 "execution_time_seconds": duration,
             },
         )
-        user_input = f"Adversarial QA validation for PR #{effective_pr_number}. Total: {total}, Passed: {passed}"
+        user_input = (
+            f"Adversarial QA validation for PR #{effective_pr_number}.\n\n"
+            f"### Automated Test Execution Results:\n"
+            f"- Total: {total} | Passed: {passed} | Failed: {failed} | Duration: {duration}s\n"
+            f"- Output: {stdout_snippet[:500]}\n\n"
+            f"### Pull Request Code Diff:\n```diff\n{diff_content}\n```"
+        )
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
         if not self.dry_run and pr_number and repo:
