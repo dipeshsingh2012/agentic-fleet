@@ -64,6 +64,14 @@ class TestHarness:
         current_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = ":".join(extra_paths) + (f":{current_pythonpath}" if current_pythonpath else "")
 
+        # Default standard test environment variables if not present
+        if "DATABASE_URL" not in env:
+            env["DATABASE_URL"] = "postgresql+asyncpg://postgres:postgres@localhost:5432/rfpengine"
+        if "TESTING" not in env:
+            env["TESTING"] = "true"
+        if "ENV" not in env:
+            env["ENV"] = "test"
+
         process = await asyncio.create_subprocess_shell(
             command,
             cwd=self.cwd,
