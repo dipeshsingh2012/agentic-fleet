@@ -1,90 +1,132 @@
-# 🛸 agentic-fleet: Centralized GitHub-Native Multi-Agent SDLC Orchestrator
+# 🛸 Agentic Fleet: Centralized Autonomous Multi-Agent SDLC
 
 [![CI Test Suite](https://github.com/dipeshsingh2012/agentic-fleet/actions/workflows/ci.yml/badge.svg)](https://github.com/dipeshsingh2012/agentic-fleet/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Models: Gemini 2.5](https://img.shields.io/badge/LLM-Google%20Gemini%202.5-purple.svg)](https://ai.google.dev/)
 
-`agentic-fleet` is the centralized, cross-repository agent orchestration engine and source of truth for the **Autonomous 5-Agent SDLC**.
+`agentic-fleet` is the centralized, cross-repository agent orchestration engine and source of truth for the **Autonomous 5-Agent SDLC**. 
 
-It decouples agent personas, system prompt contracts, and orchestration logic from individual application repositories, enabling zero-install, cloud-native automation across GitHub Issues, Pull Requests, and ChatOps.
+It decouples agent personas, defensive coding contracts, and cloud CI/CD orchestration from individual target repositories. By adding **one workflow file**, any existing or future repository (Python, TypeScript, Go, Rust, Monorepo) instantly inherits full autonomous development, adversarial QA, multi-tenant security auditing, and human-gated architectural sign-off.
 
 ---
 
-## 🌟 The 5 Role-Bound Subagents
+## 🌟 The 5 Role-Bound Subagents & Contracts
 
 | Subagent | Persona & Focus | Trigger Event | Output Contract |
 | :--- | :--- | :--- | :--- |
-| **🎯 `pm-agent`** | **Product Strategy & Framing**<br>Frames user stories, Gherkin Acceptance Criteria (`Given/When/Then`), and RICE prioritization scores. | `issues.opened` (with `agent:pm`), `@pm-agent` | Structured Issue Spec + label `agent:ready-for-dev` |
-| **🧑‍💻 `dev-agent`** | **TDD Full-Stack Engineer**<br>Creates isolated branch (`feat/<issue-id>`), writes typed code + 100% unit tests, and drafts PR. | `issues.labeled` (`agent:ready-for-dev`), `@dev-agent` | Git branch, commit diffs, Pull Request, and review fixes |
-| **🛡️ `security-agent`** | **Security & Compliance Auditor**<br>Audits diffs for multi-tenant isolation leaks (`tenant_id`), hardcoded secrets, and OWASP flaws. | `pull_request.opened`, `pull_request.synchronize` | Security Audit Report with `STATUS: PASSED/BLOCKED` |
-| **🧪 `qa-agent`** | **Adversarial QA & Test Automation**<br>Executes boundary edge cases (0-byte payloads, 400/404/422 responses, DB rollbacks) and full regressions. | `pull_request.labeled` (`ready-for-qa`), `@qa-agent` | QA Verification Report with pass/fail logs |
-| **🧙‍♂️ `senior-reviewer-agent`** | **Principal Architect & Gatekeeper**<br>Audits diffs against ADRs, validates Sec + QA green checks, posts `LGTM`, and executes squash & merge. | PR review cycle / All checks green | PR Approval (`LGTM`) + Auto-merge to `main` |
+| **🎯 `pm-agent`** | **Product Strategy & Framing**<br>Frames user stories, Gherkin Acceptance Criteria (`Given/When/Then`), and RICE prioritization scores. | `issues.opened`, `@pm-agent` | Structured Issue Spec + label `agent:ready-for-dev` |
+| **🧑‍💻 `dev-agent`** | **TDD Full-Stack Engineer**<br>Creates isolated branch (`feat/<issue-id>-<slug>`), authors clean code + 100% unit tests, materializes real files, and opens/remediates PRs. | `agent:ready-for-dev`, `@dev-agent`, PR review feedback | Git branch, materialized source & test files, Pull Request, and fix commits |
+| **🛡️ `security-agent`** | **Security & Compliance Auditor**<br>Audits git diffs for multi-tenant isolation leaks (`tenant_id` headers), hardcoded secrets, and OWASP flaws. | `pull_request.opened`, `pull_request.synchronize`, `@security-agent` | Security Audit Report with `STATUS: PASSED ✅` or `STATUS: BLOCKED ❌` |
+| **🧪 `qa-agent`** | **Adversarial QA & Test Automation**<br>Executes automated test suites (`pytest`), tests edge cases (CSV formula injection, path traversal, DoS streaming, 0-byte inputs), and audits regressions. | `ready-for-qa`, `@qa-agent` | QA Verification Report (`100% PASS ✅` or `STATUS: FAILED ❌`) |
+| **🧙‍♂️ `senior-reviewer-agent`** | **Principal Architect & Gatekeeper**<br>Audits diffs against ADRs, validates Sec + QA green checks, submits formal approval (**`LGTM ✅`**), and applies `ready-for-merge`. | Sec + QA passed, `@senior-reviewer-agent` | Architectural Review (`APPROVED LGTM ✅`) + `ready-for-merge` label |
 
 ---
 
-## 🔄 End-to-End Workflow
+## ⚡ Autonomous 5-Stage SDLC Auto-Chaining
+
+When an issue is opened (or `@fleet` is mentioned), `agentic-fleet` runs the entire 5-agent lifecycle autonomously in a single workflow run:
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    actor Human as 👤 Product Owner / Dev
-    participant TargetRepo as 📁 Target Project Repo
-    participant Fleet as 🛸 agentic-fleet Hub
-    participant PMAgent as 🎯 pm-agent
-    participant DevAgent as 🧑‍💻 dev-agent
-    participant SecAgent as 🛡️ security-agent
-    participant QAAgent as 🧪 qa-agent
-    participant ReviewAgent as 🧙‍♂️ senior-reviewer-agent
-
-    %% Phase 1: Intake
-    Human->>TargetRepo: Opens Issue #12: "Add multi-tenant vector filter" [agent:pm]
-    TargetRepo->>Fleet: Event: issue.opened (label: agent:pm)
-    Fleet->>PMAgent: Formats User Story, Gherkin ACs, RICE Score
-    PMAgent->>TargetRepo: Updates Issue #12 body & adds label [agent:ready-for-dev]
-
-    %% Phase 2: Autonomous Dev
-    TargetRepo->>Fleet: Event: label added [agent:ready-for-dev]
-    Fleet->>DevAgent: Creates branch feat/12-vector-filter
-    DevAgent->>TargetRepo: Implements code + unit tests & opens PR #25
-
-    %% Phase 3: Security & Code Review
-    TargetRepo->>Fleet: Event: pull_request.opened
-    Fleet->>SecAgent: Audits multi-tenant isolation & secrets
-    SecAgent->>TargetRepo: Posts Security Audit Sign-off (PASSED ✅)
-
-    %% Phase 4: Adversarial QA & Release
-    TargetRepo->>Fleet: Event: PR labeled [ready-for-qa]
-    Fleet->>QAAgent: Executes adversarial edge cases & regression suite
-    QAAgent->>TargetRepo: Posts QA Test Report (100% Pass ✅)
-    Fleet->>ReviewAgent: Audits diff against ADRs & confirms sign-offs
-    ReviewAgent->>TargetRepo: Approves PR (LGTM ✅) & executes squash-merge
+flowchart TD
+    A["👤 Human Opens Issue (or comments @fleet)"] --> B["🎯 1. pm-agent (Framing & Gherkin ACs)"]
+    B --> C["🧑‍💻 2. dev-agent (Creates branch, code, tests, PR)"]
+    C --> D["🛡️ 3. security-agent (Audits PR Diff)"]
+    D --> E{"Security Audit Passed?"}
+    E -->|"⚠️ Findings Flagged"| F["🧑‍💻 dev-agent Remediation (Pushes fix commit)"]
+    F --> D
+    E -->|"✅ STATUS: PASSED"| G["🧪 4. qa-agent (Runs pytest & Adversarial checks)"]
+    G --> H{"QA Tests Passed?"}
+    H -->|"⚠️ Defects / Collection Error"| I["🧑‍💻 dev-agent Remediation (Pushes fix commit)"]
+    I --> G
+    H -->|"🛑 Unresolved Failure"| J["🛑 Pipeline HALTED (Hard QA Gate)"]
+    H -->|"✅ 100% PASS"| K["🧙‍♂️ 5. senior-reviewer-agent (ADR Audit & LGTM)"]
+    K --> L["🏷️ Label: ready-for-merge (status:approved)"]
+    L --> M["👤 Human Final Review & Click Merge!"]
 ```
 
 ---
 
-## 🔌 Connecting Target Projects (Integration Guide)
+## 🧠 Core Engine Capabilities
 
-In any target repository (e.g., `RFQEngine`), create `.github/workflows/agentic-sdlc.yml`:
+### 1. 📁 Automated Code File Materializer
+* When `dev-agent` generates implementation and test code inside explicit file blocks (e.g. ````python:backend/app/services/csv_service.py````), `agentic-fleet` extracts and writes the real `.py` files into the repository workspace.
+* Automatically creates parent directory structures and stages all real files in Git (`git add .`), preventing "markdown-only" PRs.
+
+### 2. 🔍 Dynamic Live Google Model Discovery
+* Real-time query to Google AI Studio (`GET /v1beta/models?key=...`) to discover active generation models dynamically.
+* Automatically filters out deprecated legacy models (such as `gemini-1.0` and `gemini-1.5`) and selects modern active production models (`gemini-2.5-flash`, `gemini-2.0-flash`, `gemini-2.5-pro`).
+
+### 3. 🛡️ Smart Checkpointing & Stateful Resumption
+* Before executing any stage, `@fleet` inspects the existing state and labels of the PR.
+* **Zero Duplicate Spam**: Automatically skips already-passed stages (`pm-agent`, initial branch creation, `security:passed`, `qa:passed`).
+* **Direct Jump**: If QA has previously flagged defects, `@fleet` jumps directly into `dev-agent` remediation $\rightarrow$ re-tests with QA $\rightarrow$ proceeds to Architect sign-off.
+
+### 4. 🛑 Strict QA Hard Gate
+* Test collection errors, broken imports, missing dependencies, or test failures trigger a hard stop:
+  * `senior-reviewer-agent` is strictly **blocked from running**.
+  * PR is labeled `qa:failed` and `status:changes-requested`.
+  * Actionable defect logs are posted directly to the PR.
+
+### 5. 👤 Human-in-the-Loop Final Gate
+* `senior-reviewer-agent` finishes the ADR audit and approves the PR (**`LGTM ✅`**), but leaves the final green **Merge pull request** button for the human engineer.
+
+---
+
+## 🔌 Universal Integration Guide (Any Future Project in < 60s)
+
+To connect `agentic-fleet` to **any new or existing repository**:
+
+### Step 1: Configure Repository Secrets
+In the target repository's **Settings $\rightarrow$ Secrets and variables $\rightarrow$ Actions**:
+* Add `GEMINI_API_KEY`: Your Google AI Studio Gemini API Key.
+
+### Step 2: Enable GitHub Actions Pull Request Permissions
+In **Settings $\rightarrow$ Actions $\rightarrow$ General**:
+* Under *Workflow permissions*, check **"Allow GitHub Actions to create and approve pull requests"**.
+
+### Step 3: Add the Orchestration Workflow
+Create `.github/workflows/agentic-sdlc.yml` in the target repository:
 
 ```yaml
 name: Autonomous Agentic SDLC
+
+run-name: >-
+  ${{
+    github.event_name == 'issue_comment' && format('💬 {0} on #{1} by @{2}', github.event.comment.body, github.event.issue.number, github.actor) ||
+    github.event_name == 'pull_request_review_comment' && format('💬 PR Diff Comment: "{0}" by @{1}', github.event.comment.body, github.actor) ||
+    github.event_name == 'pull_request_review' && format('💬 PR Review: "{0}" by @{1}', github.event.review.body, github.actor) ||
+    github.event_name == 'issues' && format('🎯 Issue #{0}: {1}', github.event.issue.number, github.event.issue.title) ||
+    github.event_name == 'pull_request' && format('🛡️ PR #{0} ({1}): {2}', github.event.pull_request.number, github.event.action, github.event.pull_request.title) ||
+    format('🛸 Fleet Workflow: {0}', github.event_name)
+  }}
 
 on:
   issues:
     types: [opened, labeled]
   issue_comment:
-    types: [created]
+    types: [created, edited]
   pull_request:
     types: [opened, synchronize, labeled]
+  pull_request_review:
+    types: [submitted, edited]
   pull_request_review_comment:
-    types: [created]
+    types: [created, edited]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
 
 jobs:
-  agentic-orchestration:
+  agentic-orchestrator:
+    name: "Autonomous SDLC Fleet"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Target Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Checkout Central Agent Fleet
         uses: actions/checkout@v4
@@ -101,33 +143,47 @@ jobs:
 
 ---
 
+## 💬 ChatOps Command Reference
+
+You can interact with the fleet directly via GitHub comments on Issues and Pull Requests:
+
+| ChatOps Command | Action Taken |
+| :--- | :--- |
+| **`@fleet run pipeline`** | Runs the full stateful 5-agent pipeline (skips passed stages, fixes defects, reviews). |
+| **`@dev-agent <instructions>`** | Invokes developer to create a feature or push remediation commits to the PR branch. |
+| **`@security-agent please audit`** | Triggers standalone multi-tenant isolation and secret audit on the PR diff. |
+| **`@qa-agent please test`** | Triggers automated test suite execution and adversarial edge case validation. |
+| **`@senior-reviewer-agent please review`** | Audits architectural ADR compliance and submits formal PR approval. |
+
+---
+
 ## 💻 Local Development & Testing
 
 ### Installation
 ```bash
-# Clone the repository
+# Clone the central fleet
 git clone https://github.com/dipeshsingh2012/agentic-fleet.git
 cd agentic-fleet
 
-# Install with Taskfile
+# Install dependencies in virtual environment
 task install
 ```
 
-### Run Tests
+### Run Test Suite
 ```bash
-# Run full pytest suite
+# Run all 23 unit & integration tests
 task test
 
-# Run quick unit tests
+# Run fast unit tests
 task test:unit
 ```
 
 ### Dry-Run CLI Simulation
 ```bash
-# Simulate issue opened event
-task dry-run
+# Simulate full autonomous pipeline
+.venv/bin/python -m src.cli --event-name issues --agent autonomous --dry-run
 
-# Test a specific agent explicitly
+# Test a specific agent in isolation
 .venv/bin/python -m src.cli --agent security --dry-run
 ```
 
@@ -139,23 +195,23 @@ task dry-run
 agentic-fleet/
 ├── .github/
 │   └── workflows/
-│       ├── central-runner.yml       # Reusable workflow
-│       └── ci.yml                   # CI test suite for agentic-fleet
+│       ├── central-runner.yml       # Reusable central workflow
+│       └── ci.yml                   # Automated CI test suite
 ├── action.yml                       # Composite GitHub Action entrypoint
 ├── prompts/                         # Version-controlled agent system prompts
-│   ├── pm-agent.prompt.md
-│   ├── dev-agent.prompt.md
-│   ├── security-agent.prompt.md
-│   ├── qa-agent.prompt.md
-│   └── senior-reviewer-agent.prompt.md
+│   ├── pm-agent.prompt.md           # Product Management & Gherkin ACs
+│   ├── dev-agent.prompt.md          # Full-Stack TDD & Code Materialization
+│   ├── security-agent.prompt.md     # Multi-Tenant & Secret Auditor
+│   ├── qa-agent.prompt.md           # Adversarial QA & Test Automation
+│   └── senior-reviewer-agent.prompt.md # Principal Architect & ADR Gatekeeper
 ├── src/                             # Core orchestration engine
 │   ├── __init__.py
-│   ├── cli.py                       # Typer CLI entrypoint
-│   ├── event_router.py              # Webhook / Action event dispatcher
+│   ├── cli.py                       # Typer CLI & GitHub Step Summary generator
+│   ├── event_router.py              # Event router, code materializer & pipeline runner
 │   ├── github_client.py             # Asynchronous GitHub REST API client
-│   ├── llm_runner.py                # Gemini API runner & prompt loader
-│   └── test_harness.py              # Cloud test execution engine
-├── tests/                           # Unit and integration test suite
+│   ├── llm_runner.py                # Dynamic Google model discovery & LLM runner
+│   └── test_harness.py              # Test harness with automatic PYTHONPATH resolution
+├── tests/                           # Comprehensive test suite (23 tests)
 │   ├── test_cli.py
 │   ├── test_event_router.py
 │   ├── test_github_client.py
@@ -164,20 +220,10 @@ agentic-fleet/
 ├── pyproject.toml                   # Packaging & pytest config
 ├── requirements.txt                 # Dependencies
 ├── Taskfile.yml                     # Task runner
-└── README.md                        # Documentation & guides
+└── README.md                        # Master documentation & integration guide
 ```
 
 ---
 
-## 🗺️ Roadmap & Future Enhancements
-
-- [ ] **Dedicated Reviewer Token & GitHub App Identity (`REVIEWER_GITHUB_TOKEN`)**
-  - Integrate distinct GitHub App / PAT authentication for `senior-reviewer-agent` to satisfy branch protection rules with formal green `APPROVED` states and prevent self-review limitations.
-- [ ] **Single-Workflow Auto-Chaining (Autonomous Fast-Track)**
-  - Support automatic intra-job handoff (`pm` $\rightarrow$ `dev` $\rightarrow$ `sec` $\rightarrow$ `qa` $\rightarrow$ `reviewer`) in a single workflow run when triggered with `agent:autonomous`.
-- [ ] **Inline Code Review Suggestions**
-  - Equip `security-agent` and `senior-reviewer-agent` to post native GitHub code suggestion blocks (````suggestion ... ````) on specific file diff lines.
-- [ ] **Autonomous Squash & Merge Gate**
-  - Automatically execute squash and merge when all prerequisite quality gates (Security PASSED + QA 100% + Architect APPROVED) are satisfied.
-- [ ] **Multi-Model Hybrid Provider Support**
-  - Add optional fallback support for Vertex AI, Anthropic Claude 3.5 Sonnet, and OpenAI GPT-4o for cross-model consensus reviews.
+## 📄 License
+MIT License. Created by [Dipesh Singh](https://github.com/dipeshsingh2012).
