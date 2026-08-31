@@ -114,6 +114,18 @@ class EventRouter:
 
         return materialized
 
+    async def _ensure_branch_checkout(self, repo: str, branch_name: str) -> None:
+        """Fetch and checkout target branch to ensure reviews and tests run against the branch code."""
+        if not self.dry_run and branch_name and repo:
+            try:
+                await self.test_harness.run_command(f"git fetch origin {branch_name}")
+                checkout_res = await self.test_harness.run_command(f"git checkout {branch_name}")
+                if checkout_res.exit_code == 0:
+                    await self.test_harness.run_command(f"git pull origin {branch_name}")
+                    print(f"[SDLC] 🌿 Switched and synced workspace to current branch: `{branch_name}`")
+            except Exception as e:
+                print(f"[WARN] Failed checking out branch `{branch_name}`: {e}")
+
     async def _get_pr_diff_safe(self, repo: str, pr_number: int) -> str:
         """Fetch PR diff via GitHub API or local git fallback."""
         if not self.dry_run and repo and pr_number:
@@ -623,6 +635,17 @@ class EventRouter:
             return {"status": "ignored", "reason": "No PR number found for QA testing"}
 
         effective_pr_number = pr_number or 1
+
+        # GUARANTEE: Checkout and sync with the PR branch before running tests!
+        if not self.dry_run and repo and pr_number:
+            try:
+                pr_info = await self.github_client.get_pull_request(repo, effective_pr_number)
+                branch = pr_info.get("head", {}).get("ref")
+                if branch:
+                    await self._ensure_branch_checkout(repo, branch)
+            except Exception as e:
+                print(f"[WARN] QA branch checkout failed for PR #{effective_pr_number}: {e}")
+
         diff_content = await self._get_pr_diff_safe(repo, effective_pr_number)
 
         # Smart test execution: if backend/ directory exists, run pytest inside backend or target backend/tests
