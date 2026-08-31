@@ -170,48 +170,72 @@ class EventRouter:
         }
 
     async def handle_dev_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """dev-agent: creates branch, generates code & unit tests, drafts and opens PR."""
+        """dev-agent: creates branch, generates code & unit tests, drafts or remediates PR."""
+        pr_number = self._extract_pr_number(payload)
         issue = payload.get("issue", {})
         issue_number = issue.get("number", 1)
         issue_title = issue.get("title", "Implementation")
         issue_body = issue.get("body", "")
+        comment_body = payload.get("comment", {}).get("body", "")
 
-        # Compute branch slug
-        slug = re.sub(r"[^a-z0-9]+", "-", issue_title.lower()).strip("-")[:30] or "feature"
-        branch_name = f"feat/{issue_number}-{slug}"
+        is_pr_remediation = bool(pr_number)
+        effective_num = pr_number if is_pr_remediation else issue_number
+
+        branch_name = f"feat/{effective_num}"
+        if is_pr_remediation and not self.dry_run and repo:
+            try:
+                pr_info = await self.github_client.get_pull_request(repo, pr_number)
+                branch_name = pr_info.get("head", {}).get("ref", branch_name)
+            except Exception as e:
+                print(f"[WARN] Could not fetch PR branch info: {e}")
+        else:
+            slug = re.sub(r"[^a-z0-9]+", "-", issue_title.lower()).strip("-")[:30] or "feature"
+            branch_name = f"feat/{issue_number}-{slug}"
 
         prompt = self.llm_runner.load_prompt(
             "dev-agent",
-            {"issue_number": issue_number, "issue_title": issue_title, "issue_body": issue_body, "branch_name": branch_name},
+            {"issue_number": effective_num, "issue_title": issue_title, "issue_body": issue_body, "branch_name": branch_name},
         )
-        user_input = f"Implement specification for Issue #{issue_number}: {issue_title}\n\n{issue_body}"
+
+        if is_pr_remediation:
+            user_input = (
+                f"Address review and security audit feedback on Pull Request #{pr_number} for branch `{branch_name}`.\n\n"
+                f"Reviewer Feedback:\n{comment_body}\n\n"
+                f"Implement all required security remediations, tenant isolation checks, and update tests."
+            )
+        else:
+            user_input = f"Implement specification for Issue #{issue_number}: {issue_title}\n\n{issue_body}"
+
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
-        pr_number = None
-        if not self.dry_run and issue_number and repo:
+        created_pr_number = pr_number
+        if not self.dry_run and effective_num and repo:
             workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
             token = self.github_client.token
 
-            # 1. Create docs/prs/ artifact in target workspace
             prs_dir = workspace_dir / "docs" / "prs"
             prs_dir.mkdir(parents=True, exist_ok=True)
-            pr_doc_path = prs_dir / f"PR-{issue_number}.md"
+            pr_doc_path = prs_dir / f"PR-{effective_num}.md"
             pr_doc_path.write_text(response, encoding="utf-8")
 
-            # 2. Execute git operations in the target workspace
+            commit_msg = (
+                f"fix(security): remediate security audit findings on PR #{pr_number}"
+                if is_pr_remediation
+                else f"feat(sdlc): implementation for issue #{issue_number} - {issue_title}"
+            )
+
             git_commands = [
                 'git config user.name "github-actions[bot]"',
                 'git config user.email "github-actions[bot]@users.noreply.github.com"',
                 f"git checkout -B {branch_name}",
                 "git add .",
-                f'git commit -m "feat(sdlc): implementation for issue #{issue_number} - {issue_title}" --allow-empty',
+                f'git commit -m "{commit_msg}" --allow-empty',
             ]
             for cmd in git_commands:
                 res = await self.test_harness.run_command(cmd)
                 if not res.is_success and res.exit_code != 0:
                     print(f"[ERROR] Git command failed: {cmd}\nStdout: {res.stdout}\nStderr: {res.stderr}")
 
-            # Push branch with authenticated remote URL
             push_cmd = f"git push origin {branch_name} --force"
             if token:
                 push_cmd = f"git push https://x-access-token:{token}@github.com/{repo}.git {branch_name} --force"
@@ -220,42 +244,49 @@ class EventRouter:
             if not push_res.is_success and push_res.exit_code != 0:
                 print(f"[ERROR] Git push failed: {push_res.stderr} (stdout: {push_res.stdout})")
 
-            # 3. Create Pull Request via GitHub API
-            try:
-                pr_res = await self.github_client.create_pull_request(
-                    repo=repo,
-                    title=f"feat: implement Issue #{issue_number} - {issue_title}",
-                    head=branch_name,
-                    base="main",
-                    body=f"Closes #{issue_number}\n\n{response}",
-                )
-                pr_number = pr_res.get("number")
-            except Exception as e:
-                print(f"[ERROR] Create PR error: {e}")
+            if not is_pr_remediation:
+                try:
+                    pr_res = await self.github_client.create_pull_request(
+                        repo=repo,
+                        title=f"feat: implement Issue #{issue_number} - {issue_title}",
+                        head=branch_name,
+                        base="main",
+                        body=f"Closes #{issue_number}\n\n{response}",
+                    )
+                    created_pr_number = pr_res.get("number")
+                except Exception as e:
+                    print(f"[ERROR] Create PR error: {e}")
 
-            # 4. Add labels and post clean update to the issue
-            if pr_number:
-                await self.github_client.add_labels(repo, pr_number, ["ready-for-security-audit"])
-                comment_body = (
-                    f"## 🧑‍💻 `dev-agent` Update\n\n"
-                    f"Created feature branch `{branch_name}` and opened Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number}) (Closes #{issue_number}).\n\n"
-                    f"Handoff target: `security-agent`."
-                )
+            if created_pr_number:
+                await self.github_client.add_labels(repo, created_pr_number, ["ready-for-security-audit"])
+                if is_pr_remediation:
+                    comment_body = (
+                        f"## 🧑‍💻 `dev-agent` Remediation Update\n\n"
+                        f"Pushed security fixes to branch `{branch_name}` for Pull Request [**#{created_pr_number}**](https://github.com/{repo}/pull/{created_pr_number}).\n\n"
+                        f"Handoff target: `@security-agent` for re-audit."
+                    )
+                else:
+                    comment_body = (
+                        f"## 🧑‍💻 `dev-agent` Update\n\n"
+                        f"Created feature branch `{branch_name}` and opened Pull Request [**#{created_pr_number}**](https://github.com/{repo}/pull/{created_pr_number}) (Closes #{issue_number}).\n\n"
+                        f"Handoff target: `security-agent`."
+                    )
             else:
                 comment_body = (
                     f"## 🧑‍💻 `dev-agent` Update\n\n"
-                    f"Pushed feature branch `{branch_name}`."
+                    f"Pushed branch `{branch_name}`."
                 )
 
-            await self.github_client.create_issue_comment(repo, issue_number, comment_body)
-            await self.github_client.add_labels(repo, issue_number, ["ready-for-security-audit"])
+            target_id = created_pr_number if is_pr_remediation else issue_number
+            await self.github_client.create_issue_comment(repo, target_id, comment_body)
+            await self.github_client.add_labels(repo, target_id, ["ready-for-security-audit"])
 
         return {
             "agent": "dev-agent",
-            "action": "toggled_development",
-            "issue_number": issue_number,
+            "action": "remediated_pr" if is_pr_remediation else "toggled_development",
+            "issue_number": effective_num,
             "branch_name": branch_name,
-            "pr_number": pr_number,
+            "pr_number": created_pr_number,
             "response": response,
         }
 
