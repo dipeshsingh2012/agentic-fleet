@@ -145,6 +145,37 @@ class EventRouter:
 
         return "(No code changes detected or synthetic diff)"
 
+    async def _get_pr_reviews_summary(self, repo: str, pr_number: int) -> str:
+        """Fetch and format prior reviews and feedback from other agents on this PR."""
+        if self.dry_run or not repo or not pr_number:
+            return ""
+
+        try:
+            reviews = await self.github_client.get_pr_reviews(repo, pr_number)
+            comments = await self.github_client.get_issue_comments(repo, pr_number)
+
+            summary_lines = []
+            for r in reversed(reviews[-5:]):
+                body = r.get("body", "").strip()
+                user = r.get("user", {}).get("login", "reviewer")
+                state = r.get("state", "COMMENT")
+                if body:
+                    summary_lines.append(f"#### 💬 Review by @{user} ({state}):\n{body[:1200]}\n")
+
+            if not summary_lines and comments:
+                for c in reversed(comments[-3:]):
+                    body = c.get("body", "").strip()
+                    user = c.get("user", {}).get("login", "user")
+                    if body:
+                        summary_lines.append(f"#### 💬 Comment by @{user}:\n{body[:1000]}\n")
+
+            if summary_lines:
+                return "### 📋 Prior Review & Audit History on this PR:\n" + "\n".join(summary_lines)
+        except Exception as e:
+            print(f"[WARN] Failed fetching PR review history: {e}")
+
+        return ""
+
     async def route_event(
         self,
         event_name: str,
@@ -470,10 +501,13 @@ class EventRouter:
             {"issue_number": effective_num, "issue_title": issue_title, "issue_body": issue_body, "branch_name": branch_name},
         )
 
+        review_history = await self._get_pr_reviews_summary(repo, pr_number) if pr_number else ""
+
         if is_pr_remediation:
             user_input = (
                 f"Address review and audit feedback on Pull Request #{pr_number} for branch `{branch_name}`.\n\n"
-                f"Reviewer Feedback:\n{comment_body}\n\n"
+                f"{review_history}\n\n"
+                f"Latest Reviewer Feedback:\n{comment_body}\n\n"
                 f"Implement all required remediations, place files under backend/app/ and backend/tests/, and output all code blocks using ```python:backend/path/to/file.py."
             )
         else:
@@ -723,10 +757,12 @@ class EventRouter:
 
         effective_pr_number = pr_number or 1
         diff_content = await self._get_pr_diff_safe(repo, effective_pr_number)
+        review_history = await self._get_pr_reviews_summary(repo, effective_pr_number)
 
         prompt = self.llm_runner.load_prompt("senior-reviewer-agent", {"pr_number": effective_pr_number})
         user_input = (
             f"Principal Architect review and ADR compliance audit for Pull Request #{effective_pr_number}.\n\n"
+            f"{review_history}\n\n"
             f"### Code Changes & Git Diff:\n```diff\n{diff_content}\n```"
         )
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)

@@ -1,5 +1,6 @@
 """
-GitHub REST API client for agentic-fleet orchestration.
+Asynchronous GitHub REST API client using httpx.
+Supports Issues, Pull Requests, Reviews, Comments, Labels, and Review History.
 """
 
 from __future__ import annotations
@@ -34,6 +35,22 @@ class GitHubClient:
             resp = await client.get(f"/repos/{repo}/issues/{issue_number}")
             resp.raise_for_status()
             return resp.json()
+
+    async def get_issue_comments(self, repo: str, issue_number: int) -> List[Dict[str, Any]]:
+        """Fetch all comments on an issue or PR."""
+        async with self._get_client() as client:
+            resp = await client.get(f"/repos/{repo}/issues/{issue_number}/comments", params={"per_page": 30})
+            if resp.status_code == 200:
+                return resp.json()
+            return []
+
+    async def get_pr_reviews(self, repo: str, pr_number: int) -> List[Dict[str, Any]]:
+        """Fetch all submitted reviews on a pull request."""
+        async with self._get_client() as client:
+            resp = await client.get(f"/repos/{repo}/pulls/{pr_number}/reviews", params={"per_page": 30})
+            if resp.status_code == 200:
+                return resp.json()
+            return []
 
     async def create_issue_comment(self, repo: str, issue_number: int, body: str) -> Dict[str, Any]:
         """Post a comment on an issue or pull request."""
