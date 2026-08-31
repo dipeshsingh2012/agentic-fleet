@@ -155,12 +155,12 @@ class EventRouter:
         """
         Smart, stateful SDLC orchestrator:
         - Inspects current PR & Issue label states.
-        - Skips already-completed stages (no duplicate review spam).
-        - Automatically executes pending / next-in-line reviews.
-        - Remediates defects between dev and security/QA.
+        - Automatically drives pending / review / remediation steps forward.
+        - Executes remediation loop if QA or Security flagged defects.
+        - Delivers final architectural sign-off (leaving merge to human).
         """
         print("\n=======================================================")
-        print("🛸 SMART AGENTIC FLEET PIPELINE (Stateful Inspection)")
+        print("🛸 SMART AGENTIC FLEET PIPELINE (Autonomous Orchestration)")
         print("=======================================================\n")
 
         issue_payload = payload.get("issue", {})
@@ -198,7 +198,7 @@ class EventRouter:
         # -------------------------------------------------------------
         # STAGE 1: Product Management & Specification (pm-agent)
         # -------------------------------------------------------------
-        if pr_number or "agent:ready-for-dev" in issue_labels or "ready-for-security-audit" in issue_labels or "status:approved" in pr_labels:
+        if pr_number or "agent:ready-for-dev" in issue_labels or "ready-for-security-audit" in issue_labels:
             print("[STAGE 1/5] ⏭️ pm-agent: Specification already accepted. Skipping duplicate framing.")
             pipeline_summary["stages"]["pm_agent"] = {"status": "skipped", "reason": "already_completed"}
         else:
@@ -229,77 +229,62 @@ class EventRouter:
         # -------------------------------------------------------------
         # STAGE 3: Security & Multi-Tenant Audit (security-agent)
         # -------------------------------------------------------------
-        if "security:passed" in pr_labels and not self.dry_run:
-            print(f"[STAGE 3/5] ⏭️ security-agent: Multi-tenant audit already passed (security:passed). Skipping duplicate review.")
-            pipeline_summary["stages"]["security_agent"] = {"status": "skipped", "verdict": "PASSED"}
-            is_sec_blocked = False
-        else:
-            print(f"\n[STAGE 3/5] 🛡️ Running security-agent for PR #{effective_pr_number}...")
+        print(f"\n[STAGE 3/5] 🛡️ Running security-agent for PR #{effective_pr_number}...")
+        sec_result = await self.handle_security_agent(repo, pr_payload)
+        pipeline_summary["stages"]["security_agent"] = sec_result
+
+        sec_response = sec_result.get("response", "")
+        is_sec_blocked = "STATUS: BLOCKED" in sec_response or "CRITICAL" in sec_response or "HIGH" in sec_response
+
+        if is_sec_blocked:
+            print("\n[STAGE 3.1] ⚠️ Security defects detected. Invoking dev-agent to remediate...")
+            remediation_payload = {
+                "repository": {"full_name": repo},
+                "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
+                "comment": {"body": f"Please fix the following security findings:\n\n{sec_response}"},
+            }
+            remed_result = await self.handle_dev_agent(repo, remediation_payload)
+            pipeline_summary["stages"]["security_remediation"] = remed_result
+
+            print("[STAGE 3.2] 🛡️ Re-auditing security post-remediation...")
             sec_result = await self.handle_security_agent(repo, pr_payload)
-            pipeline_summary["stages"]["security_agent"] = sec_result
-
+            pipeline_summary["stages"]["security_agent_recheck"] = sec_result
             sec_response = sec_result.get("response", "")
-            is_sec_blocked = "STATUS: BLOCKED" in sec_response or "CRITICAL" in sec_response or "HIGH" in sec_response
-
-            if is_sec_blocked:
-                print("\n[STAGE 3.1] ⚠️ Security defects detected. Invoking dev-agent to remediate...")
-                remediation_payload = {
-                    "repository": {"full_name": repo},
-                    "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
-                    "comment": {"body": f"Please fix the following security findings:\n\n{sec_response}"},
-                }
-                remed_result = await self.handle_dev_agent(repo, remediation_payload)
-                pipeline_summary["stages"]["security_remediation"] = remed_result
-
-                print("[STAGE 3.2] 🛡️ Re-auditing security post-remediation...")
-                sec_result = await self.handle_security_agent(repo, pr_payload)
-                pipeline_summary["stages"]["security_agent_recheck"] = sec_result
-                sec_response = sec_result.get("response", "")
-                is_sec_blocked = "STATUS: BLOCKED" in sec_response or "CRITICAL" in sec_response
+            is_sec_blocked = "STATUS: BLOCKED" in sec_response or "CRITICAL" in sec_response
 
         # -------------------------------------------------------------
         # STAGE 4: Adversarial QA & Test Execution (qa-agent)
         # -------------------------------------------------------------
-        if "qa:passed" in pr_labels and not self.dry_run and not is_sec_blocked:
-            print(f"[STAGE 4/5] ⏭️ qa-agent: QA verification already passed (qa:passed). Skipping duplicate review.")
-            pipeline_summary["stages"]["qa_agent"] = {"status": "skipped", "verdict": "PASSED"}
-            is_qa_failed = False
-        else:
-            print(f"\n[STAGE 4/5] 🧪 Running qa-agent for PR #{effective_pr_number}...")
+        print(f"\n[STAGE 4/5] 🧪 Running qa-agent for PR #{effective_pr_number}...")
+        qa_result = await self.handle_qa_agent(repo, pr_payload)
+        pipeline_summary["stages"]["qa_agent"] = qa_result
+
+        qa_response = qa_result.get("response", "")
+        is_qa_failed = "STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "FAIL ❌" in qa_response or "CRITICAL" in qa_response
+
+        if is_qa_failed:
+            print("\n[STAGE 4.1] ⚠️ QA defects detected. Invoking dev-agent to remediate on branch...")
+            remediation_payload = {
+                "repository": {"full_name": repo},
+                "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
+                "comment": {"body": f"Please fix the following QA defects and adversarial test failures:\n\n{qa_response}"},
+            }
+            remed_qa_result = await self.handle_dev_agent(repo, remediation_payload)
+            pipeline_summary["stages"]["qa_remediation"] = remed_qa_result
+
+            print("[STAGE 4.2] 🧪 Re-running QA verification post-remediation...")
             qa_result = await self.handle_qa_agent(repo, pr_payload)
-            pipeline_summary["stages"]["qa_agent"] = qa_result
-
+            pipeline_summary["stages"]["qa_agent_recheck"] = qa_result
             qa_response = qa_result.get("response", "")
-            is_qa_failed = "STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "FAIL ❌" in qa_response or "CRITICAL" in qa_response
-
-            if is_qa_failed:
-                print("\n[STAGE 4.1] ⚠️ QA defects detected. Invoking dev-agent to remediate...")
-                remediation_payload = {
-                    "repository": {"full_name": repo},
-                    "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
-                    "comment": {"body": f"Please fix the following QA defects and adversarial test failures:\n\n{qa_response}"},
-                }
-                remed_qa_result = await self.handle_dev_agent(repo, remediation_payload)
-                pipeline_summary["stages"]["qa_remediation"] = remed_qa_result
-
-                print("[STAGE 4.2] 🧪 Re-running QA verification post-remediation...")
-                qa_result = await self.handle_qa_agent(repo, pr_payload)
-                pipeline_summary["stages"]["qa_agent_recheck"] = qa_result
-                qa_response = qa_result.get("response", "")
-                is_qa_failed = "STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "FAIL ❌" in qa_response
+            is_qa_failed = "STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "FAIL ❌" in qa_response
 
         # -------------------------------------------------------------
         # STAGE 5: Principal Architect Review & Sign-off (senior-reviewer-agent)
         # -------------------------------------------------------------
-        if "status:approved" in pr_labels and "ready-for-merge" in pr_labels and not is_sec_blocked and not is_qa_failed and not self.dry_run:
-            print(f"[STAGE 5/5] ⏭️ senior-reviewer-agent: PR #{effective_pr_number} already APPROVED. Skipping duplicate review.")
-            pipeline_summary["stages"]["senior_reviewer_agent"] = {"status": "skipped", "verdict": "APPROVED"}
-            all_passed = True
-        else:
-            print(f"\n[STAGE 5/5] 🧙‍♂️ Running senior-reviewer-agent (ADR Audit & Approval)...")
-            reviewer_result = await self.handle_senior_reviewer_agent(repo, pr_payload)
-            pipeline_summary["stages"]["senior_reviewer_agent"] = reviewer_result
-            all_passed = (not is_sec_blocked) and (not is_qa_failed)
+        print(f"\n[STAGE 5/5] 🧙‍♂️ Running senior-reviewer-agent (ADR Audit & Approval)...")
+        reviewer_result = await self.handle_senior_reviewer_agent(repo, pr_payload)
+        pipeline_summary["stages"]["senior_reviewer_agent"] = reviewer_result
+        all_passed = (not is_sec_blocked) and (not is_qa_failed)
 
         sec_status_icon = "STATUS: BLOCKED ❌" if is_sec_blocked else "STATUS: PASSED ✅"
         qa_status_icon = "STATUS: FAILED ❌" if is_qa_failed else "STATUS: PASSED ✅"
@@ -393,9 +378,9 @@ class EventRouter:
 
         if is_pr_remediation:
             user_input = (
-                f"Address review and security audit feedback on Pull Request #{pr_number} for branch `{branch_name}`.\n\n"
+                f"Address review and audit feedback on Pull Request #{pr_number} for branch `{branch_name}`.\n\n"
                 f"Reviewer Feedback:\n{comment_body}\n\n"
-                f"Implement all required security remediations, tenant isolation checks, and update tests."
+                f"Implement all required remediations, tenant isolation checks, and update tests."
             )
         else:
             user_input = f"Implement specification for Issue #{issue_number}: {issue_title}\n\n{issue_body}"
@@ -413,7 +398,7 @@ class EventRouter:
             pr_doc_path.write_text(response, encoding="utf-8")
 
             commit_msg = (
-                f"fix(security): remediate audit findings on PR #{pr_number}"
+                f"fix(sdlc): remediate review findings on PR #{pr_number}"
                 if is_pr_remediation
                 else f"feat(sdlc): implementation for issue #{issue_number} - {issue_title}"
             )
@@ -452,12 +437,11 @@ class EventRouter:
                     print(f"[ERROR] Create PR error: {e}")
 
             if created_pr_number:
-                await self.github_client.add_labels(repo, created_pr_number, ["ready-for-security-audit"])
                 if is_pr_remediation:
                     comment_body = (
                         f"## 🧑‍💻 `dev-agent` Remediation Update\n\n"
                         f"Pushed fixes to branch `{branch_name}` for Pull Request [**#{created_pr_number}**](https://github.com/{repo}/pull/{created_pr_number}).\n\n"
-                        f"Handoff target: `@security-agent` for re-audit."
+                        f"Handoff target: `@security-agent` & `@qa-agent` for re-verification."
                     )
                 else:
                     comment_body = (
@@ -473,7 +457,6 @@ class EventRouter:
 
             target_id = created_pr_number if is_pr_remediation else issue_number
             await self.github_client.create_issue_comment(repo, target_id, comment_body)
-            await self.github_client.add_labels(repo, target_id, ["ready-for-security-audit"])
 
         return {
             "agent": "dev-agent",
@@ -518,7 +501,13 @@ class EventRouter:
 
         if not self.dry_run and pr_number and repo:
             await self.github_client.create_pr_review(repo, pr_number, response, event="COMMENT")
-            await self.github_client.add_labels(repo, pr_number, ["security:passed", "ready-for-qa"])
+            is_blocked = "STATUS: BLOCKED" in response or "CRITICAL" in response or "HIGH" in response
+            if is_blocked:
+                await self.github_client.remove_label(repo, pr_number, "security:passed")
+                await self.github_client.add_labels(repo, pr_number, ["security:blocked"])
+            else:
+                await self.github_client.remove_label(repo, pr_number, "security:blocked")
+                await self.github_client.add_labels(repo, pr_number, ["security:passed", "ready-for-qa"])
 
         return {
             "agent": "security-agent",
@@ -577,7 +566,13 @@ class EventRouter:
 
         if not self.dry_run and pr_number and repo:
             await self.github_client.create_pr_review(repo, pr_number, response, event="COMMENT")
-            await self.github_client.add_labels(repo, pr_number, ["qa:passed", "ready-for-review"])
+            is_failed = "STATUS: FAILED" in response or "FAILED ❌" in response or "FAIL ❌" in response or failed > 0
+            if is_failed:
+                await self.github_client.remove_label(repo, pr_number, "qa:passed")
+                await self.github_client.add_labels(repo, pr_number, ["qa:failed"])
+            else:
+                await self.github_client.remove_label(repo, pr_number, "qa:failed")
+                await self.github_client.add_labels(repo, pr_number, ["qa:passed", "ready-for-review"])
 
         return {
             "agent": "qa-agent",
