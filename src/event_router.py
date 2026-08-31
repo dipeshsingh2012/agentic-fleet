@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -159,24 +160,39 @@ class EventRouter:
 
         pr_number = None
         if not self.dry_run and issue_number and repo:
+            workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+            token = self.github_client.token
+
+            # 1. Create docs/prs/ artifact in target workspace
+            prs_dir = workspace_dir / "docs" / "prs"
+            prs_dir.mkdir(parents=True, exist_ok=True)
+            pr_doc_path = prs_dir / f"PR-{issue_number}.md"
+            pr_doc_path.write_text(response, encoding="utf-8")
+
+            # 2. Execute git operations in the target workspace
+            git_commands = [
+                'git config user.name "github-actions[bot]"',
+                'git config user.email "github-actions[bot]@users.noreply.github.com"',
+                f'git checkout -B {branch_name}',
+                'git add .',
+                f'git commit -m "feat(sdlc): implementation for issue #{issue_number} - {issue_title}" --allow-empty',
+            ]
+            for cmd in git_commands:
+                res = await self.test_harness.run_command(cmd)
+                if not res.is_success and res.exit_code != 0:
+                    logger.error(f"Git command failed: {cmd}\nStdout: {res.stdout}\nStderr: {res.stderr}")
+
+            # Push branch with authenticated remote URL
+            push_cmd = f"git push origin {branch_name} --force"
+            if token:
+                push_cmd = f"git push https://x-access-token:{token}@github.com/{repo}.git {branch_name} --force"
+            
+            push_res = await self.test_harness.run_command(push_cmd)
+            if not push_res.is_success and push_res.exit_code != 0:
+                logger.error(f"Git push failed: {push_res.stderr} (stdout: {push_res.stdout})")
+
+            # 3. Create Pull Request via GitHub API
             try:
-                # 1. Create docs/prs/ artifact
-                prs_dir = Path("docs/prs")
-                prs_dir.mkdir(parents=True, exist_ok=True)
-                pr_doc_path = prs_dir / f"PR-{issue_number}.md"
-                pr_doc_path.write_text(response, encoding="utf-8")
-
-                # 2. Git operations in the runner workspace
-                await self.test_harness.run_command('git config user.name "dev-agent[bot]"')
-                await self.test_harness.run_command('git config user.email "dev-agent@agentic-fleet.local"')
-                await self.test_harness.run_command(f"git checkout -B {branch_name}")
-                await self.test_harness.run_command("git add .")
-                await self.test_harness.run_command(
-                    f'git commit -m "feat(sdlc): autonomous implementation for issue #{issue_number} - {issue_title}" --allow-empty'
-                )
-                await self.test_harness.run_command(f"git push -u origin {branch_name} --force")
-
-                # 3. Create Pull Request via GitHub API
                 pr_res = await self.github_client.create_pull_request(
                     repo=repo,
                     title=f"feat: implement Issue #{issue_number} - {issue_title}",
@@ -186,21 +202,20 @@ class EventRouter:
                 )
                 pr_number = pr_res.get("number")
             except Exception as e:
-                logger.warning(f"Git push or PR creation error: {e}")
+                logger.error(f"Create PR error: {e}")
 
-            # 4. Add labels and post notification comment
+            # 4. Add labels and post ONLY a clean link to the issue (NO PR content dump)
             if pr_number:
                 await self.github_client.add_labels(repo, pr_number, ["ready-for-security-audit"])
                 comment_body = (
-                    f"## 🧑‍💻 `dev-agent` Implementation Complete\n\n"
-                    f"Created branch `{branch_name}` and opened Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number}).\n\n"
-                    f"{response}"
+                    f"## 🧑‍💻 `dev-agent` Update\n\n"
+                    f"Created feature branch `{branch_name}` and opened Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number}) (Closes #{issue_number}).\n\n"
+                    f"Handoff target: `security-agent`."
                 )
             else:
                 comment_body = (
-                    f"## 🧑‍💻 `dev-agent` Implementation Plan\n\n"
-                    f"Pushed branch `{branch_name}`.\n\n"
-                    f"{response}"
+                    f"## 🧑‍💻 `dev-agent` Update\n\n"
+                    f"Pushed feature branch `{branch_name}`."
                 )
 
             await self.github_client.create_issue_comment(repo, issue_number, comment_body)

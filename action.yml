@@ -44,12 +44,14 @@ runs:
 
     - name: Execute Agentic Fleet Orchestrator
       shell: bash
-      working-directory: ${{ github.action_path }}
+      working-directory: ${{ github.workspace }}
       env:
+        PYTHONPATH: ${{ github.action_path }}
         GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         GITHUB_EVENT_NAME: ${{ inputs.event-name }}
         GITHUB_EVENT_PATH: ${{ inputs.event-path }}
+        TARGET_WORKSPACE: ${{ github.workspace }}
       run: |
         python -m src.cli \
           --event-name "${{ inputs.event-name }}" \
