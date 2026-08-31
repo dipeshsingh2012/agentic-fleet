@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -53,8 +54,9 @@ class EventRouter:
         return None
 
     def _materialize_code_files(self, workspace_dir: Path, content: str) -> Dict[str, str]:
-        """Extract and write all source and test code blocks into real repository files."""
+        """Extract and write all source and test code blocks into real repository files with __init__.py support."""
         files: Dict[str, str] = {}
+        has_backend_dir = (workspace_dir / "backend").exists() and (workspace_dir / "backend").is_dir()
 
         # Pattern 1: ```lang:path/to/file.ext\ncode\n```
         p1 = re.compile(r"```[a-zA-Z0-9_\-\.]*:([a-zA-Z0-9_\-\.\/]+)\n(.*?)```", re.DOTALL)
@@ -77,14 +79,40 @@ class EventRouter:
                 if path_clean not in files and not path_clean.endswith(".md"):
                     files[path_clean] = code
 
-        # Write each extracted file to disk in workspace_dir
+        materialized: Dict[str, str] = {}
         for rel_path, file_code in files.items():
-            target_path = workspace_dir / rel_path
+            target_rel = rel_path
+            # If repo has backend/ layout and path starts with app/ or tests/, map to backend/
+            if has_backend_dir and not target_rel.startswith("backend/") and (target_rel.startswith("app/") or target_rel.startswith("tests/")):
+                target_rel = f"backend/{target_rel}"
+
+            target_path = workspace_dir / target_rel
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(file_code.strip() + "\n", encoding="utf-8")
-            print(f"[DEV-AGENT] 📝 Materialized file ({len(file_code)} chars): {rel_path}")
+            materialized[target_rel] = file_code
+            print(f"[DEV-AGENT] 📝 Materialized file ({len(file_code)} chars): {target_rel}")
 
-        return files
+            # Ensure all parent Python directories contain __init__.py
+            curr_dir = target_path.parent
+            while curr_dir != workspace_dir and curr_dir.is_relative_to(workspace_dir):
+                init_file = curr_dir / "__init__.py"
+                if not init_file.exists() and (curr_dir.name not in ["tests", "docs"]):
+                    init_file.write_text("# Package marker\n", encoding="utf-8")
+                    print(f"[DEV-AGENT] 📦 Created package marker: {init_file.relative_to(workspace_dir)}")
+                curr_dir = curr_dir.parent
+
+        # Clean up misplaced root-level folders if backend/ exists
+        if has_backend_dir:
+            for root_dir in ["app", "tests"]:
+                root_path = workspace_dir / root_dir
+                if root_path.exists() and root_path.is_dir() and (workspace_dir / "backend" / root_dir).exists():
+                    try:
+                        shutil.rmtree(root_path)
+                        print(f"[DEV-AGENT] 🧹 Cleaned up redundant root folder: {root_dir}/")
+                    except Exception:
+                        pass
+
+        return materialized
 
     async def _get_pr_diff_safe(self, repo: str, pr_number: int) -> str:
         """Fetch PR diff via GitHub API or local git fallback."""
@@ -303,7 +331,7 @@ class EventRouter:
             remediation_payload = {
                 "repository": {"full_name": repo},
                 "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
-                "comment": {"body": "Address previous QA verification and adversarial test findings: extract and write code to real python files (app/services/csv_service.py, tests/test_csv_service.py), resolve pytest collection error, escape CSV formulas by stripping whitespace, sanitize Content-Disposition header against path traversal, and use Header(alias='X-Tenant-ID')."},
+                "comment": {"body": "Address previous QA verification and adversarial test findings: ensure code is under backend/app/ and tests under backend/tests/, ensure __init__.py exists, verify chunked CSV streaming generator, and fix pytest collection errors."},
             }
             remed_qa_result = await self.handle_dev_agent(repo, remediation_payload)
             pipeline_summary["stages"]["qa_remediation"] = remed_qa_result
@@ -454,10 +482,10 @@ class EventRouter:
             user_input = (
                 f"Address review and audit feedback on Pull Request #{pr_number} for branch `{branch_name}`.\n\n"
                 f"Reviewer Feedback:\n{comment_body}\n\n"
-                f"Implement all required remediations, extract and output all python source and test files using ```python:path/to/file.py blocks."
+                f"Implement all required remediations, place files under backend/app/ and backend/tests/, and output all code blocks using ```python:backend/path/to/file.py."
             )
         else:
-            user_input = f"Implement specification for Issue #{issue_number}: {issue_title}\n\n{issue_body}\n\nOutput all files in ```python:path/to/file.py blocks."
+            user_input = f"Implement specification for Issue #{issue_number}: {issue_title}\n\n{issue_body}\n\nOutput all files in ```python:backend/path/to/file.py blocks."
 
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
@@ -596,7 +624,7 @@ class EventRouter:
         }
 
     async def handle_qa_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """qa-agent: executes adversarial tests and full regression suite."""
+        """qa-agent: executes adversarial tests and full regression suite with accurate metric reporting."""
         pr_number = self._extract_pr_number(payload)
         issue_number = payload.get("issue", {}).get("number")
 
@@ -617,12 +645,23 @@ class EventRouter:
         effective_pr_number = pr_number or 1
         diff_content = await self._get_pr_diff_safe(repo, effective_pr_number)
 
-        test_res = await self.test_harness.run_command("pytest -v") if not self.dry_run else None
-        total = test_res.total_tests if test_res and test_res.total_tests > 0 else 15
-        passed = test_res.passed_tests if test_res and test_res.passed_tests > 0 else 15
-        failed = test_res.failed_tests if test_res else 0
-        duration = test_res.duration_seconds if test_res and test_res.duration_seconds > 0 else 1.25
-        stdout_snippet = test_res.stdout if test_res and test_res.stdout else "All automated regression tests passed."
+        # Smart test execution: if backend/ directory exists, run pytest inside backend or target backend/tests
+        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        test_cmd = "pytest -v backend/tests" if (workspace_dir / "backend").exists() else "pytest -v"
+
+        test_res = await self.test_harness.run_command(test_cmd) if not self.dry_run else None
+        if test_res:
+            total = test_res.total_tests
+            passed = test_res.passed_tests
+            failed = test_res.failed_tests
+            duration = test_res.duration_seconds
+            stdout_snippet = test_res.stdout + ("\n" + test_res.stderr if test_res.stderr else "")
+        else:
+            total = 15
+            passed = 15
+            failed = 0
+            duration = 1.25
+            stdout_snippet = "All automated regression tests passed."
 
         prompt = self.llm_runner.load_prompt(
             "qa-agent",
@@ -636,9 +675,9 @@ class EventRouter:
         )
         user_input = (
             f"Adversarial QA validation for PR #{effective_pr_number}.\n\n"
-            f"### Automated Test Execution Results:\n"
+            f"### Automated Test Execution Results ({test_cmd}):\n"
             f"- Total: {total} | Passed: {passed} | Failed: {failed} | Duration: {duration}s\n"
-            f"- Output:\n```\n{stdout_snippet[:800]}\n```\n\n"
+            f"- Output:\n```\n{stdout_snippet[:1200]}\n```\n\n"
             f"### Pull Request Code Diff:\n```diff\n{diff_content}\n```"
         )
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
