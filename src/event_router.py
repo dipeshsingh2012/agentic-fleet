@@ -57,35 +57,39 @@ class EventRouter:
 
         # 1. Issue Events
         if event_name == "issues":
+            added_label = payload.get("label", {}).get("name", "")
             labels = [lbl.get("name", "") for lbl in payload.get("issue", {}).get("labels", [])]
-            if "agent:pm" in labels or action == "opened":
-                return await self.handle_pm_agent(repo_name, payload)
-            if "agent:ready-for-dev" in labels:
+
+            if added_label == "agent:ready-for-dev" or "agent:ready-for-dev" in labels:
                 return await self.handle_dev_agent(repo_name, payload)
+            if added_label == "agent:pm" or "agent:pm" in labels or action == "opened":
+                return await self.handle_pm_agent(repo_name, payload)
 
         # 2. Issue Comments / Mentions
-        elif event_name == "issue_comment" and action == "created":
-            comment_body = payload.get("comment", {}).get("body", "")
-            if "@pm-agent" in comment_body:
-                return await self.handle_pm_agent(repo_name, payload)
-            if "@dev-agent" in comment_body:
+        elif event_name == "issue_comment" and action in ["created", "edited"]:
+            comment_body = payload.get("comment", {}).get("body", "").lower()
+            if "@dev-agent" in comment_body or "dev-agent" in comment_body or "@dev" in comment_body:
                 return await self.handle_dev_agent(repo_name, payload)
-            if "@security-agent" in comment_body:
+            if "@pm-agent" in comment_body or "pm-agent" in comment_body or "@pm" in comment_body:
+                return await self.handle_pm_agent(repo_name, payload)
+            if "@security-agent" in comment_body or "security-agent" in comment_body:
                 return await self.handle_security_agent(repo_name, payload)
-            if "@qa-agent" in comment_body:
+            if "@qa-agent" in comment_body or "qa-agent" in comment_body:
                 return await self.handle_qa_agent(repo_name, payload)
-            if "@senior-reviewer-agent" in comment_body:
+            if "@senior-reviewer-agent" in comment_body or "senior-reviewer" in comment_body:
                 return await self.handle_senior_reviewer_agent(repo_name, payload)
 
         # 3. Pull Request Events
         elif event_name == "pull_request":
+            added_label = payload.get("label", {}).get("name", "")
             pr_labels = [lbl.get("name", "") for lbl in payload.get("pull_request", {}).get("labels", [])]
-            if action in ["opened", "synchronize"]:
-                return await self.handle_security_agent(repo_name, payload)
-            if "ready-for-qa" in pr_labels:
-                return await self.handle_qa_agent(repo_name, payload)
-            if "ready-for-review" in pr_labels:
+
+            if added_label == "ready-for-review" or "ready-for-review" in pr_labels:
                 return await self.handle_senior_reviewer_agent(repo_name, payload)
+            if added_label == "ready-for-qa" or "ready-for-qa" in pr_labels:
+                return await self.handle_qa_agent(repo_name, payload)
+            if action in ["opened", "synchronize"] or added_label == "ready-for-security-audit" or "ready-for-security-audit" in pr_labels:
+                return await self.handle_security_agent(repo_name, payload)
 
         # Default fallback
         return {
@@ -124,6 +128,7 @@ class EventRouter:
 
         if not self.dry_run and issue_number and repo:
             await self.github_client.create_issue_comment(repo, issue_number, response)
+            await self.github_client.remove_label(repo, issue_number, "agent:pm")
             await self.github_client.add_labels(repo, issue_number, ["agent:ready-for-dev"])
 
         return {
