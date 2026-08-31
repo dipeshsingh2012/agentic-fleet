@@ -635,7 +635,7 @@ class EventRouter:
             passed = test_res.passed_tests
             failed = test_res.failed_tests
             duration = test_res.duration_seconds
-            stdout_snippet = test_res.stdout + ("\n" + test_res.stderr if test_res.stderr else "")
+            stdout_snippet = test_res.failure_summary if failed > 0 else (test_res.stdout + ("\n" + test_res.stderr if test_res.stderr else ""))[:3000]
         else:
             total = 15
             passed = 15

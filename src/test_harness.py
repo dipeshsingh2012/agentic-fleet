@@ -1,5 +1,5 @@
 """
-Test harness for running and evaluating automated test suites with automatic PYTHONPATH configuration.
+Test harness for running and evaluating automated test suites with automatic PYTHONPATH configuration and failure extraction.
 """
 
 from __future__ import annotations
@@ -27,9 +27,19 @@ class TestResult:
 
     @property
     def is_success(self) -> bool:
-        # Exit code 0 means clean execution and all passed
-        # Exit code 5 in pytest means no tests found/collected (neutral only if exit code 0)
         return self.exit_code == 0 and self.failed_tests == 0
+
+    @property
+    def failure_summary(self) -> str:
+        """Extract the failure tracebacks and summary from output."""
+        full_text = self.stdout + ("\n" + self.stderr if self.stderr else "")
+        if "=== FAILURES ===" in full_text:
+            failures_section = full_text.split("=== FAILURES ===")[1]
+            return "=== FAILURES ===\n" + failures_section[-3500:]
+        elif "=== short test summary info ===" in full_text:
+            summary_section = full_text.split("=== short test summary info ===")[1]
+            return "=== short test summary info ===\n" + summary_section[-3500:]
+        return full_text[-3000:] if len(full_text) > 3000 else full_text
 
 
 class TestHarness:
