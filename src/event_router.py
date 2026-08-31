@@ -1,6 +1,6 @@
 """
 GitHub event router for multi-agent SDLC lifecycle transitions.
-Supports both single-agent event dispatching and smart stateful 5-stage SDLC auto-chaining with hard QA gates.
+Supports both single-agent event dispatching, smart code file materialization, and 5-stage SDLC auto-chaining.
 """
 
 from __future__ import annotations
@@ -51,6 +51,40 @@ class EventRouter:
         if "pull_request" in issue and isinstance(issue["pull_request"], dict):
             return issue.get("number")
         return None
+
+    def _materialize_code_files(self, workspace_dir: Path, content: str) -> Dict[str, str]:
+        """Extract and write all source and test code blocks into real repository files."""
+        files: Dict[str, str] = {}
+
+        # Pattern 1: ```lang:path/to/file.ext\ncode\n```
+        p1 = re.compile(r"```[a-zA-Z0-9_\-\.]*:([a-zA-Z0-9_\-\.\/]+)\n(.*?)```", re.DOTALL)
+        for match in p1.finditer(content):
+            path_str = match.group(1).strip()
+            code = match.group(2)
+            if not path_str.endswith(".md"):
+                files[path_str] = code
+
+        # Pattern 2: Header/Comment path followed immediately by ```lang\ncode\n```
+        p2 = re.compile(
+            r"(?:###?\s*(?:File:\s*)?`?([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+)`?|#\s*filepath:\s*([a-zA-Z0-9_\-\.\/]+)|#\s*([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+))\s*\n\s*```[a-zA-Z0-9_\-\.]*\n(.*?)```",
+            re.DOTALL,
+        )
+        for match in p2.finditer(content):
+            path_str = match.group(1) or match.group(2) or match.group(3)
+            code = match.group(4)
+            if path_str:
+                path_clean = path_str.strip("`'\" ")
+                if path_clean not in files and not path_clean.endswith(".md"):
+                    files[path_clean] = code
+
+        # Write each extracted file to disk in workspace_dir
+        for rel_path, file_code in files.items():
+            target_path = workspace_dir / rel_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(file_code.strip() + "\n", encoding="utf-8")
+            print(f"[DEV-AGENT] 📝 Materialized file ({len(file_code)} chars): {rel_path}")
+
+        return files
 
     async def _get_pr_diff_safe(self, repo: str, pr_number: int) -> str:
         """Fetch PR diff via GitHub API or local git fallback."""
@@ -269,7 +303,7 @@ class EventRouter:
             remediation_payload = {
                 "repository": {"full_name": repo},
                 "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
-                "comment": {"body": "Address previous QA verification and adversarial test findings: resolve pytest collection error, escape CSV formulas by stripping whitespace, sanitize Content-Disposition header against path traversal, and use Header(alias='X-Tenant-ID')."},
+                "comment": {"body": "Address previous QA verification and adversarial test findings: extract and write code to real python files (app/services/csv_service.py, tests/test_csv_service.py), resolve pytest collection error, escape CSV formulas by stripping whitespace, sanitize Content-Disposition header against path traversal, and use Header(alias='X-Tenant-ID')."},
             }
             remed_qa_result = await self.handle_dev_agent(repo, remediation_payload)
             pipeline_summary["stages"]["qa_remediation"] = remed_qa_result
@@ -389,13 +423,13 @@ class EventRouter:
         }
 
     async def handle_dev_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """dev-agent: creates branch, generates code & unit tests, drafts or remediates PR."""
+        """dev-agent: creates branch, generates code & unit tests, materializes files, drafts/remediates PR."""
         pr_number = self._extract_pr_number(payload)
         issue = payload.get("issue", {})
         issue_number = issue.get("number", 1)
         issue_title = issue.get("title", "Implementation")
         issue_body = issue.get("body", "")
-        comment_body = payload.get("comment", {}).get("body", "")
+        comment_body = payload.get("comment", {}).get("body", "") or payload.get("review", {}).get("body", "")
 
         is_pr_remediation = bool(pr_number)
         effective_num = pr_number if is_pr_remediation else issue_number
@@ -420,10 +454,10 @@ class EventRouter:
             user_input = (
                 f"Address review and audit feedback on Pull Request #{pr_number} for branch `{branch_name}`.\n\n"
                 f"Reviewer Feedback:\n{comment_body}\n\n"
-                f"Implement all required remediations, fix any test collection/syntax errors, and update tests."
+                f"Implement all required remediations, extract and output all python source and test files using ```python:path/to/file.py blocks."
             )
         else:
-            user_input = f"Implement specification for Issue #{issue_number}: {issue_title}\n\n{issue_body}"
+            user_input = f"Implement specification for Issue #{issue_number}: {issue_title}\n\n{issue_body}\n\nOutput all files in ```python:path/to/file.py blocks."
 
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
@@ -432,13 +466,18 @@ class EventRouter:
             workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
             token = self.github_client.token
 
+            # 1. Write docs/prs/ artifact
             prs_dir = workspace_dir / "docs" / "prs"
             prs_dir.mkdir(parents=True, exist_ok=True)
             pr_doc_path = prs_dir / f"PR-{effective_num}.md"
             pr_doc_path.write_text(response, encoding="utf-8")
 
+            # 2. Materialize code and test files into the actual codebase!
+            extracted_files = self._materialize_code_files(workspace_dir, response)
+            print(f"[DEV-AGENT] 🚀 Materialized {len(extracted_files)} files: {list(extracted_files.keys())}")
+
             commit_msg = (
-                f"fix(sdlc): remediate review findings on PR #{pr_number}"
+                f"fix(sdlc): remediate review findings and materialize source files on PR #{pr_number}"
                 if is_pr_remediation
                 else f"feat(sdlc): implementation for issue #{issue_number} - {issue_title}"
             )
@@ -480,8 +519,8 @@ class EventRouter:
                 if is_pr_remediation:
                     comment_body = (
                         f"## 🧑‍💻 `dev-agent` Remediation Update\n\n"
-                        f"Pushed fixes to branch `{branch_name}` for Pull Request [**#{created_pr_number}**](https://github.com/{repo}/pull/{created_pr_number}).\n\n"
-                        f"Handoff target: `@security-agent` & `@qa-agent` for re-verification."
+                        f"Pushed {len(extracted_files)} materialized files to branch `{branch_name}` for Pull Request [**#{created_pr_number}**](https://github.com/{repo}/pull/{created_pr_number}).\n\n"
+                        f"Handoff target: `@qa-agent` for re-verification."
                     )
                 else:
                     comment_body = (

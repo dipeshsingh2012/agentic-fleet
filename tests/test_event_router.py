@@ -125,3 +125,27 @@ async def test_route_autonomous_pipeline():
     assert "qa_agent" in result["stages"]
     assert "senior_reviewer_agent" in result["stages"]
     assert result["status"] == "completed_awaiting_human_merge"
+
+
+def test_materialize_code_files(tmp_path):
+    router = EventRouter(dry_run=True)
+    content = """
+Here is the implementation:
+
+```python:app/services/calculator.py
+def add(a, b):
+    return a + b
+```
+
+```python:tests/test_calculator.py
+from app.services.calculator import add
+def test_add():
+    assert add(1, 2) == 3
+```
+"""
+    files = router._materialize_code_files(tmp_path, content)
+    assert "app/services/calculator.py" in files
+    assert "tests/test_calculator.py" in files
+    assert (tmp_path / "app" / "services" / "calculator.py").exists()
+    assert (tmp_path / "tests" / "test_calculator.py").exists()
+    assert "def add(a, b):" in (tmp_path / "app" / "services" / "calculator.py").read_text()
