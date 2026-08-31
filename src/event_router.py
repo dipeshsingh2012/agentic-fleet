@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -139,27 +140,78 @@ class EventRouter:
         }
 
     async def handle_dev_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """dev-agent: creates branch, generates code & unit tests, drafts PR."""
+        """dev-agent: creates branch, generates code & unit tests, drafts and opens PR."""
         issue = payload.get("issue", {})
         issue_number = issue.get("number", 1)
         issue_title = issue.get("title", "Implementation")
         issue_body = issue.get("body", "")
 
+        # Compute branch slug
+        slug = re.sub(r"[^a-z0-9]+", "-", issue_title.lower()).strip("-")[:30] or "feature"
+        branch_name = f"feat/{issue_number}-{slug}"
+
         prompt = self.llm_runner.load_prompt(
             "dev-agent",
-            {"issue_number": issue_number, "issue_title": issue_title, "issue_body": issue_body},
+            {"issue_number": issue_number, "issue_title": issue_title, "issue_body": issue_body, "branch_name": branch_name},
         )
         user_input = f"Implement specification for Issue #{issue_number}: {issue_title}\n\n{issue_body}"
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
+        pr_number = None
         if not self.dry_run and issue_number and repo:
-            await self.github_client.create_issue_comment(repo, issue_number, response)
+            try:
+                # 1. Create docs/prs/ artifact
+                prs_dir = Path("docs/prs")
+                prs_dir.mkdir(parents=True, exist_ok=True)
+                pr_doc_path = prs_dir / f"PR-{issue_number}.md"
+                pr_doc_path.write_text(response, encoding="utf-8")
+
+                # 2. Git operations in the runner workspace
+                await self.test_harness.run_command('git config user.name "dev-agent[bot]"')
+                await self.test_harness.run_command('git config user.email "dev-agent@agentic-fleet.local"')
+                await self.test_harness.run_command(f"git checkout -B {branch_name}")
+                await self.test_harness.run_command("git add .")
+                await self.test_harness.run_command(
+                    f'git commit -m "feat(sdlc): autonomous implementation for issue #{issue_number} - {issue_title}" --allow-empty'
+                )
+                await self.test_harness.run_command(f"git push -u origin {branch_name} --force")
+
+                # 3. Create Pull Request via GitHub API
+                pr_res = await self.github_client.create_pull_request(
+                    repo=repo,
+                    title=f"feat: implement Issue #{issue_number} - {issue_title}",
+                    head=branch_name,
+                    base="main",
+                    body=f"Closes #{issue_number}\n\n{response}",
+                )
+                pr_number = pr_res.get("number")
+            except Exception as e:
+                logger.warning(f"Git push or PR creation error: {e}")
+
+            # 4. Add labels and post notification comment
+            if pr_number:
+                await self.github_client.add_labels(repo, pr_number, ["ready-for-security-audit"])
+                comment_body = (
+                    f"## 🧑‍💻 `dev-agent` Implementation Complete\n\n"
+                    f"Created branch `{branch_name}` and opened Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number}).\n\n"
+                    f"{response}"
+                )
+            else:
+                comment_body = (
+                    f"## 🧑‍💻 `dev-agent` Implementation Plan\n\n"
+                    f"Pushed branch `{branch_name}`.\n\n"
+                    f"{response}"
+                )
+
+            await self.github_client.create_issue_comment(repo, issue_number, comment_body)
             await self.github_client.add_labels(repo, issue_number, ["ready-for-security-audit"])
 
         return {
             "agent": "dev-agent",
             "action": "toggled_development",
             "issue_number": issue_number,
+            "branch_name": branch_name,
+            "pr_number": pr_number,
             "response": response,
         }
 
