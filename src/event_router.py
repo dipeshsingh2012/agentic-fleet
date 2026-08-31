@@ -316,17 +316,31 @@ class EventRouter:
                 or payload.get("review", {}).get("body", "")
             ).lower()
 
+            # 1. Pipeline trigger
             if "@fleet" in comment_body or "@autonomous" in comment_body or "run pipeline" in comment_body:
                 return await self.run_autonomous_pipeline(repo_name, payload)
-            if "@dev-agent" in comment_body or "dev-agent" in comment_body or "@dev" in comment_body:
+
+            # 2. Automated remediation trigger on failure/block reviews
+            if (
+                "status: failed" in comment_body
+                or "status: blocked" in comment_body
+                or "action required for dev-agent" in comment_body
+                or "action required by dev-agent" in comment_body
+                or payload.get("review", {}).get("state") == "changes_requested"
+            ):
+                print("[EVENT ROUTER] 🧑‍💻 Review reported defects / changes requested. Routing directly to dev-agent for remediation...")
                 return await self.handle_dev_agent(repo_name, payload)
-            if "@pm-agent" in comment_body or "pm-agent" in comment_body or "@pm" in comment_body:
+
+            # 3. Explicit agent mentions
+            if "@dev-agent" in comment_body or "@dev" in comment_body:
+                return await self.handle_dev_agent(repo_name, payload)
+            if "@pm-agent" in comment_body or "@pm" in comment_body:
                 return await self.handle_pm_agent(repo_name, payload)
-            if "@security-agent" in comment_body or "security-agent" in comment_body:
+            if "@security-agent" in comment_body:
                 return await self.handle_security_agent(repo_name, payload)
-            if "@qa-agent" in comment_body or "qa-agent" in comment_body:
+            if "@qa-agent" in comment_body:
                 return await self.handle_qa_agent(repo_name, payload)
-            if "@senior-reviewer-agent" in comment_body or "senior-reviewer" in comment_body or "@reviewer" in comment_body:
+            if "@senior-reviewer-agent" in comment_body or "@reviewer" in comment_body:
                 return await self.handle_senior_reviewer_agent(repo_name, payload)
 
         # 3. Pull Request Events

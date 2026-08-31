@@ -170,3 +170,17 @@ def test_agent_context_builder(tmp_path):
     assert "Add CSV Export" in block
     assert "Review by @security-agent" in block
     assert "63 passed" in block
+
+
+@pytest.mark.asyncio
+async def test_route_review_failure_to_dev():
+    router = EventRouter(dry_run=True)
+    payload = {
+        "action": "submitted",
+        "review": {"body": "## 🧪 QA Verification\nSTATUS: FAILED ❌\nAction Required for dev-agent"},
+        "pull_request": {"number": 4},
+        "repository": {"full_name": "owner/repo"}
+    }
+    result = await router.route_event("pull_request_review", payload)
+    assert result["agent"] == "dev-agent"
+    assert result["action"] == "remediated_pr"
