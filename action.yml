@@ -7,9 +7,13 @@ inputs:
     description: "Google Gemini API Key for LLM reasoning"
     required: true
   github-token:
-    description: "GitHub token for reading issues/PRs, posting reviews, adding labels, and merging"
+    description: "GitHub token for reading issues/PRs, posting reviews, adding labels, and pushing code"
     required: true
     default: ${{ github.token }}
+  reviewer-github-token:
+    description: "Optional dedicated reviewer token for official PR approvals without author collision"
+    required: false
+    default: ""
   event-name:
     description: "GitHub event name (issues, pull_request, issue_comment)"
     required: false
@@ -58,6 +62,7 @@ runs:
         PYTHONPATH: ${{ github.action_path }}
         GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
+        REVIEWER_GITHUB_TOKEN: ${{ inputs.reviewer-github-token }}
         GITHUB_EVENT_NAME: ${{ inputs.event-name }}
         GITHUB_EVENT_PATH: ${{ inputs.event-path }}
         TARGET_WORKSPACE: ${{ github.workspace }}

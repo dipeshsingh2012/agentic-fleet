@@ -588,7 +588,7 @@ class EventRouter:
             issue_info={"number": issue_number, "title": issue_title, "body": issue_body},
         )
         user_input = f"{context_block}\n\nPlease author the user story, Gherkin acceptance criteria, and RICE score for Issue #{issue_number}."
-        response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
+        response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="fast")
 
         if not self.dry_run and issue_number and repo:
             await self.github_client.create_issue_comment(repo, issue_number, response)
@@ -661,7 +661,7 @@ class EventRouter:
                 f"Output all implementation and test files using ```python:backend/path/to/file.py blocks."
             )
 
-        response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
+        response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="fast")
 
         created_pr_number = pr_number
         if not self.dry_run and effective_num and repo:
@@ -694,7 +694,7 @@ class EventRouter:
                         f"Please fix all missing imports (e.g. from typing import AsyncGenerator, etc.), missing functions, and test errors.\n"
                         f"Output all corrected files in ```python:backend/path/to/file.py blocks."
                     )
-                    fix_response = await self.llm_runner.generate_response(prompt, fix_input, dry_run=self.dry_run)
+                    fix_response = await self.llm_runner.generate_response(prompt, fix_input, dry_run=self.dry_run, tier="fast")
                     re_extracted = self._materialize_code_files(workspace_dir, fix_response)
                     extracted_files.update(re_extracted)
                     response += "\n\n" + fix_response
@@ -822,7 +822,7 @@ class EventRouter:
             f"{context_block}\n\n"
             f"Perform multi-tenant isolation, secrets, and OWASP audit for Pull Request #{effective_pr_number}."
         )
-        response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
+        response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="deep")
 
         if not self.dry_run and pr_number and repo:
             await self.github_client.create_pr_review(repo, pr_number, response, event="COMMENT")
@@ -926,7 +926,7 @@ class EventRouter:
             f"{context_block}\n\n"
             f"Adversarial QA validation for PR #{effective_pr_number} using command `{test_cmd}`."
         )
-        response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
+        response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="fast")
 
         if not self.dry_run and pr_number and repo:
             await self.github_client.create_pr_review(repo, pr_number, response, event="COMMENT")
@@ -995,7 +995,7 @@ class EventRouter:
             f"{context_block}\n\n"
             f"Principal Architect review, ADR compliance audit, and merge readiness evaluation for Pull Request #{effective_pr_number}."
         )
-        response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
+        response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="deep")
 
         if not self.dry_run and pr_number and repo:
             await self.github_client.create_pr_review(repo, pr_number, response, event="APPROVE")

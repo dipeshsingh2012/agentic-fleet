@@ -1,6 +1,6 @@
 """
 Asynchronous GitHub REST API client using httpx.
-Supports Issues, Pull Requests, Reviews, Comments, Labels, and Review History.
+Supports Issues, Pull Requests, Reviews, Inline Diff Comments, Labels, and Review History.
 """
 
 from __future__ import annotations
@@ -16,8 +16,14 @@ logger = logging.getLogger("agentic-fleet.github_client")
 class GitHubClient:
     """Async GitHub REST API Client using httpx."""
 
-    def __init__(self, token: Optional[str] = None, base_url: str = "https://api.github.com"):
+    def __init__(
+        self,
+        token: Optional[str] = None,
+        reviewer_token: Optional[str] = None,
+        base_url: str = "https://api.github.com",
+    ):
         self.token = token or os.getenv("GITHUB_TOKEN", "")
+        self.reviewer_token = reviewer_token or os.getenv("REVIEWER_GITHUB_TOKEN", "")
         self.base_url = base_url.rstrip("/")
         self.headers = {
             "Accept": "application/vnd.github.v3+json",
@@ -26,8 +32,11 @@ class GitHubClient:
         if self.token:
             self.headers["Authorization"] = f"Bearer {self.token}"
 
-    def _get_client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(base_url=self.base_url, headers=self.headers, timeout=30.0)
+    def _get_client(self, use_reviewer_token: bool = False) -> httpx.AsyncClient:
+        headers = dict(self.headers)
+        if use_reviewer_token and self.reviewer_token:
+            headers["Authorization"] = f"Bearer {self.reviewer_token}"
+        return httpx.AsyncClient(base_url=self.base_url, headers=headers, timeout=30.0)
 
     async def get_issue(self, repo: str, issue_number: int) -> Dict[str, Any]:
         """Fetch issue details by number."""
@@ -134,7 +143,6 @@ class GitHubClient:
 
             print(f"[WARN] First PR creation attempt failed: HTTP {resp.status_code}: {resp.text}")
 
-            # Try prefixing head with owner (e.g. dipeshsingh2012:feat/...)
             if ":" not in head and "/" in repo:
                 owner = repo.split("/")[0]
                 namespaced_head = f"{owner}:{head}"
@@ -145,7 +153,6 @@ class GitHubClient:
                     return retry_resp.json()
                 print(f"[WARN] Namespaced PR retry failed: HTTP {retry_resp.status_code}: {retry_resp.text}")
 
-            # Check if PR already exists for this branch
             existing_pr = await self.find_existing_pr(repo, head)
             if existing_pr:
                 print(f"[INFO] Found existing open PR #{existing_pr.get('number')} for branch '{head}'")
@@ -161,15 +168,17 @@ class GitHubClient:
         body: str,
         event: str = "COMMENT",
     ) -> Dict[str, Any]:
-        """Submit a PR review (handles GitHub self-review 422 by falling back to COMMENT)."""
-        async with self._get_client() as client:
+        """Submit a PR review (supports separate REVIEWER_GITHUB_TOKEN to avoid self-review 422)."""
+        # If event is APPROVE, try using reviewer token if available
+        use_rev_token = bool(self.reviewer_token and event == "APPROVE")
+        async with self._get_client(use_reviewer_token=use_rev_token) as client:
             payload = {"body": body, "event": event}
             resp = await client.post(
                 f"/repos/{repo}/pulls/{pr_number}/reviews",
                 json=payload,
             )
 
-            # If APPROVE failed with 422 (e.g., GitHub rule: author bot cannot APPROVE own PR)
+            # If APPROVE failed with 422 (e.g. self-review restriction on single token)
             if resp.status_code == 422 and event != "COMMENT":
                 print(f"[WARN] PR review with event '{event}' returned 422 (self-review restriction). Retrying with event='COMMENT'...")
                 payload["event"] = "COMMENT"
@@ -180,12 +189,35 @@ class GitHubClient:
                 if retry_resp.status_code in [200, 201]:
                     return retry_resp.json()
 
-                # If review endpoint still rejects, post directly as a PR comment
                 print(f"[INFO] Fallback to standard PR issue comment...")
                 return await self.create_issue_comment(repo, pr_number, body)
 
             resp.raise_for_status()
             return resp.json()
+
+    async def create_inline_pr_comment(
+        self,
+        repo: str,
+        pr_number: int,
+        commit_id: str,
+        path: str,
+        line: int,
+        body: str,
+    ) -> Dict[str, Any]:
+        """Post an inline review comment/suggestion directly on a specific line of code diff in a PR."""
+        async with self._get_client() as client:
+            payload = {
+                "body": body,
+                "commit_id": commit_id,
+                "path": path,
+                "line": line,
+                "side": "RIGHT",
+            }
+            resp = await client.post(f"/repos/{repo}/pulls/{pr_number}/comments", json=payload)
+            if resp.status_code in [200, 201]:
+                return resp.json()
+            print(f"[WARN] Inline comment failed HTTP {resp.status_code}: {resp.text}")
+            return {}
 
     async def merge_pull_request(
         self,

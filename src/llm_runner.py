@@ -1,6 +1,6 @@
 """
 LLM execution runner for dispatching tasks to Gemini models via Google GenAI SDK and REST fallback.
-Includes dynamic model discovery to automatically query active Google AI Studio models and filter deprecated versions.
+Features Multi-Model Tiering (Fast vs Deep) and dynamic model discovery with specialized model filtering.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ logger = logging.getLogger("agentic-fleet.llm_runner")
 
 
 class LLMRunner:
-    """Runner for prompt management and Gemini API communication."""
+    """Runner for prompt management, model discovery, and multi-tier Gemini API communication."""
 
     def __init__(
         self,
@@ -32,7 +32,7 @@ class LLMRunner:
         prompts_dir: Optional[Path] = None,
     ):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
         self.prompts_dir = prompts_dir or (Path(__file__).parent.parent / "prompts")
         self._discovered_models: Optional[List[str]] = None
 
@@ -58,7 +58,7 @@ class LLMRunner:
         return content
 
     async def discover_active_models(self) -> List[str]:
-        """Query Google API for the list of currently active and supported generateContent models."""
+        """Query Google API for active generateContent models, filtering non-text models."""
         if self._discovered_models:
             return self._discovered_models
 
@@ -73,31 +73,59 @@ class LLMRunner:
                         for item in data.get("models", []):
                             methods = item.get("supportedGenerationMethods", [])
                             name = item.get("name", "").replace("models/", "")
-                            # Filter out deprecated 1.0 / 1.5 models and ensure generateContent is supported
-                            if "generateContent" in methods and not name.startswith("gemini-1.") and not name.startswith("text-embedding"):
+                            
+                            # Filter out non-general text models (tts, robotics, image, transcribe, clip)
+                            is_excluded = any(
+                                tag in name.lower()
+                                for tag in ["tts", "robotics", "image", "transcribe", "clip", "banana", "embed", "1.0", "1.5"]
+                            )
+                            if "generateContent" in methods and not is_excluded:
                                 discovered.append(name)
-                        print(f"[LLM] 🔍 Discovered {len(discovered)} active models from Google API: {discovered[:5]}")
+                        print(f"[LLM] 🔍 Discovered {len(discovered)} active text models: {discovered[:6]}")
             except Exception as e:
                 print(f"[WARN] Dynamic model discovery failed: {e}")
 
-        # Built-in modern fallback candidates (excluding deprecated 1.5)
+        # Modern fallbacks prioritized by stability
         defaults = [
-            self.model,
-            "gemini-2.5-flash",
             "gemini-2.0-flash",
+            "gemini-flash-latest",
+            "gemma-4-26b-a4b-it",
+            "gemma-4-31b-it",
+            "gemini-2.5-flash",
             "gemini-2.5-pro",
+            "gemini-pro-latest",
             "gemini-2.0-flash-lite",
-            "gemini-2.0-pro-exp",
         ]
-        
+
         final_list: List[str] = []
         for m in (discovered or defaults):
             clean = m.replace("models/", "")
-            if clean and clean not in final_list and not clean.startswith("gemini-1."):
+            if clean and clean not in final_list:
                 final_list.append(clean)
 
         self._discovered_models = final_list
         return final_list
+
+    def get_tiered_candidates(self, available_models: List[str], tier: str = "fast") -> List[str]:
+        """Order candidate models based on performance tier (fast vs deep)."""
+        if tier == "deep":
+            # Prioritize large reasoning models
+            deep_priority = ["pro", "31b", "26b", "2.5-pro", "gemini-pro-latest", "gemini-2.0-flash"]
+            sorted_models = sorted(
+                available_models,
+                key=lambda m: any(p in m.lower() for p in deep_priority),
+                reverse=True,
+            )
+            return sorted_models
+        else:
+            # Prioritize fast, high-throughput models
+            fast_priority = ["2.0-flash", "flash-latest", "flash-lite", "26b", "gemini-2.5-flash"]
+            sorted_models = sorted(
+                available_models,
+                key=lambda m: any(p in m.lower() for p in fast_priority),
+                reverse=True,
+            )
+            return sorted_models
 
     async def generate_response(
         self,
@@ -105,8 +133,9 @@ class LLMRunner:
         user_prompt: str,
         temperature: float = 0.2,
         dry_run: bool = False,
+        tier: str = "fast",
     ) -> str:
-        """Generate response from Gemini API using Google GenAI SDK with REST fallback."""
+        """Generate response using GenAI SDK with REST fallback and multi-model tiering."""
         if dry_run or not self.api_key:
             return (
                 f"### [DRY RUN / MOCK MODE]\n\n"
@@ -115,10 +144,11 @@ class LLMRunner:
                 f"**Simulated Agent Verdict**: STATUS: PASSED / COMPLETED"
             )
 
-        candidate_models = await self.discover_active_models()
-        print(f"[LLM] 🚀 Attempting generation with candidate models: {candidate_models}")
+        all_models = await self.discover_active_models()
+        candidate_models = self.get_tiered_candidates(all_models, tier=tier)
+        print(f"[LLM] 🚀 Attempting [{tier.upper()} TIER] generation with models: {candidate_models[:5]}")
 
-        # Strategy 1: Official Google GenAI SDK
+        # 1. Google GenAI Official SDK
         if HAS_GENAI_SDK:
             for model_name in candidate_models:
                 try:
@@ -126,64 +156,46 @@ class LLMRunner:
                     config = types.GenerateContentConfig(
                         system_instruction=system_instruction,
                         temperature=temperature,
-                        max_output_tokens=8192,
                     )
-                    resp = await client.aio.models.generate_content(
+                    resp = client.models.generate_content(
                         model=model_name,
                         contents=user_prompt,
                         config=config,
                     )
                     if resp.text:
-                        print(f"[LLM] ✅ Successfully generated response using GenAI SDK model: {model_name}")
+                        print(f"[LLM] ✅ Successfully generated response using SDK model: {model_name}")
                         return resp.text
                 except Exception as e:
-                    print(f"[WARN] GenAI SDK model '{model_name}' attempt failed: {e}")
+                    err_str = str(e)
+                    if "404" in err_str or "NOT_FOUND" in err_str:
+                        print(f"[WARN] Model '{model_name}' 404 Not Found. Skipping.")
+                    elif "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        print(f"[WARN] Model '{model_name}' quota exhausted. Trying next model...")
+                    else:
+                        print(f"[WARN] GenAI SDK model '{model_name}' attempt failed: {e}")
 
-        # Strategy 2: Direct REST with valid Google AI Studio headers and parameters
-        last_error = None
-
-        payload = {
-            "system_instruction": {
-                "parts": [{"text": system_instruction}]
-            },
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": user_prompt}]
-                }
-            ],
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": 8192,
-            }
-        }
-
+        # 2. REST API Fallback
         for model_name in candidate_models:
-            clean_model = model_name.replace("models/", "")
-            urls = [
-                f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent?key={self.api_key}",
-                f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent",
-            ]
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.api_key}"
+            payload = {
+                "systemInstruction": {"parts": [{"text": system_instruction}]},
+                "contents": [{"parts": [{"text": user_prompt}]}],
+                "generationConfig": {"temperature": temperature},
+            }
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(url, json=payload)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        candidates = data.get("candidates", [])
+                        if candidates and "content" in candidates[0]:
+                            parts = candidates[0]["content"].get("parts", [])
+                            if parts and "text" in parts[0]:
+                                print(f"[LLM] ✅ Successfully generated response using REST model: {model_name}")
+                                return parts[0]["text"]
+                    elif resp.status_code == 404:
+                        continue
+            except Exception as e:
+                print(f"[WARN] REST API fallback error for model '{model_name}': {e}")
 
-            for url in urls:
-                headers = {
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": self.api_key,
-                }
-
-                try:
-                    async with httpx.AsyncClient(timeout=90.0) as client:
-                        resp = await client.post(url, json=payload, headers=headers)
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            candidate = data["candidates"][0]
-                            text = candidate["content"]["parts"][0]["text"]
-                            print(f"[LLM] ✅ Successfully generated response using REST model: {clean_model}")
-                            return text
-                        else:
-                            last_error = f"HTTP {resp.status_code} for {clean_model}: {resp.text}"
-                            print(f"[WARN] REST {clean_model}: HTTP {resp.status_code}")
-                except Exception as e:
-                    last_error = str(e)
-
-        raise RuntimeError(f"All Gemini generation attempts failed. Last error: {last_error}")
+        raise RuntimeError("All Gemini generation attempts failed across all discovered models.")
