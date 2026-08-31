@@ -255,31 +255,50 @@ class EventRouter:
             is_sec_blocked = False if self.dry_run else ("STATUS: BLOCKED" in sec_response or "VERDICT: BLOCKED" in sec_response or "STATUS: FAILED" in sec_response)
 
         # -------------------------------------------------------------
-        # STAGE 4: Adversarial QA & Test Execution (qa-agent)
+        # STAGE 4: Adversarial QA & Test Execution (qa-agent & dev remediation)
         # -------------------------------------------------------------
-        print(f"\n[STAGE 4/5] 🧪 Running qa-agent for PR #{effective_pr_number}...")
-        qa_result = await self.handle_qa_agent(repo, pr_payload)
-        pipeline_summary["stages"]["qa_agent"] = qa_result
+        has_pending_qa_failure = "qa:failed" in pr_labels and not self.dry_run
 
-        qa_response = qa_result.get("response", "")
-        is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
-
-        if is_qa_failed:
-            print("\n[STAGE 4.1] ⚠️ QA defects / test collection errors detected. Invoking dev-agent to remediate on branch...")
+        if has_pending_qa_failure:
+            print(f"\n[STAGE 4/5] 🧑‍💻 PR #{effective_pr_number} has pending QA findings (qa:failed). Jumping straight to dev-agent remediation...")
             remediation_payload = {
                 "repository": {"full_name": repo},
                 "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
-                "comment": {"body": f"Please fix the following QA defects, test collection errors, and adversarial failures:\n\n{qa_response}"},
+                "comment": {"body": "Address previous QA verification and adversarial test findings: resolve pytest collection error, escape CSV formulas by stripping whitespace, sanitize Content-Disposition header against path traversal, and use Header(alias='X-Tenant-ID')."},
             }
             remed_qa_result = await self.handle_dev_agent(repo, remediation_payload)
             pipeline_summary["stages"]["qa_remediation"] = remed_qa_result
 
-            print("[STAGE 4.2] 🧪 Re-running QA verification post-remediation...")
+            # Run QA verification on the remediated code
+            print("[STAGE 4.1] 🧪 Running QA verification on newly remediated branch...")
             qa_result = await self.handle_qa_agent(repo, pr_payload)
-            pipeline_summary["stages"]["qa_agent_recheck"] = qa_result
+            pipeline_summary["stages"]["qa_agent"] = qa_result
             qa_response = qa_result.get("response", "")
             is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
 
+        else:
+            print(f"\n[STAGE 4/5] 🧪 Running qa-agent for PR #{effective_pr_number}...")
+            qa_result = await self.handle_qa_agent(repo, pr_payload)
+            pipeline_summary["stages"]["qa_agent"] = qa_result
+
+            qa_response = qa_result.get("response", "")
+            is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
+
+            if is_qa_failed:
+                print("\n[STAGE 4.1] ⚠️ QA defects / test collection errors detected. Invoking dev-agent to remediate on branch...")
+                remediation_payload = {
+                    "repository": {"full_name": repo},
+                    "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
+                    "comment": {"body": f"Please fix the following QA defects, test collection errors, and adversarial failures:\n\n{qa_response}"},
+                }
+                remed_qa_result = await self.handle_dev_agent(repo, remediation_payload)
+                pipeline_summary["stages"]["qa_remediation"] = remed_qa_result
+
+                print("[STAGE 4.2] 🧪 Re-running QA verification post-remediation...")
+                qa_result = await self.handle_qa_agent(repo, pr_payload)
+                pipeline_summary["stages"]["qa_agent_recheck"] = qa_result
+                qa_response = qa_result.get("response", "")
+                is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
         # HARD GATE: If QA failed due to collection errors or test failures, HALT PIPELINE IMMEDIATELY!
         if is_qa_failed:
             print("\n[HALT] 🛑 QA verification failed (test collection/execution/edge case error). Halting pipeline before Senior Reviewer.")
