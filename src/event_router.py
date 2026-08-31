@@ -156,9 +156,9 @@ class EventRouter:
         Executes the entire 5-Agent SDLC Lifecycle autonomously in a single workflow run:
         1. pm-agent: frames User Story, Gherkin ACs, and RICE score.
         2. dev-agent: creates feature branch, implements code & unit tests, pushes, and opens PR.
-        3. security-agent: audits multi-tenant isolation and secrets (triggers dev-agent remediation if needed).
-        4. qa-agent: executes automated test suite & adversarial edge cases.
-        5. senior-reviewer-agent: reviews against ADRs, approves PR (LGTM), and leaves final merge to human.
+        3. security-agent: audits multi-tenant isolation and secrets (triggers dev-agent remediation if flagged).
+        4. qa-agent: executes automated test suite & adversarial edge cases (triggers dev-agent remediation if flagged).
+        5. senior-reviewer-agent: reviews against ADRs, approves PR if Sec + QA passed (leaves merge to human).
         """
         print("\n=======================================================")
         print("🚀 STARTING AUTONOMOUS 5-AGENT SDLC PIPELINE")
@@ -206,22 +206,26 @@ class EventRouter:
         sec_result = await self.handle_security_agent(repo, pr_payload)
         pipeline_summary["stages"]["security_agent"] = sec_result
 
-        # Inter-agent remediation check: if security findings exist, invoke dev-agent to fix
+        # Inter-agent remediation check for security
         sec_response = sec_result.get("response", "")
-        if "STATUS: BLOCKED" in sec_response or "CRITICAL" in sec_response or "HIGH" in sec_response:
-            print("\n[STAGE 3.1] ⚠️ Security audit flagged findings. Invoking dev-agent to remediate...")
+        is_sec_blocked = "STATUS: BLOCKED" in sec_response or "CRITICAL" in sec_response or "HIGH" in sec_response
+
+        if is_sec_blocked:
+            print("\n[STAGE 3.1] ⚠️ Security audit flagged defects. Invoking dev-agent to remediate...")
             remediation_payload = {
                 "repository": {"full_name": repo},
                 "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
-                "comment": {"body": f"Please remediate security findings:\n{sec_response}"},
+                "comment": {"body": f"Please remediate security audit findings:\n\n{sec_response}"},
             }
             remed_result = await self.handle_dev_agent(repo, remediation_payload)
             pipeline_summary["stages"]["security_remediation"] = remed_result
 
-            # Re-audit security
+            # Re-audit security post-remediation
             print("[STAGE 3.2] 🛡️ Re-auditing security post-remediation...")
             sec_result = await self.handle_security_agent(repo, pr_payload)
             pipeline_summary["stages"]["security_agent_recheck"] = sec_result
+            sec_response = sec_result.get("response", "")
+            is_sec_blocked = "STATUS: BLOCKED" in sec_response or "CRITICAL" in sec_response
 
         # -------------------------------------------------------------
         # STAGE 4: Adversarial QA & Test Execution (qa-agent)
@@ -230,6 +234,27 @@ class EventRouter:
         qa_result = await self.handle_qa_agent(repo, pr_payload)
         pipeline_summary["stages"]["qa_agent"] = qa_result
 
+        # Inter-agent remediation check for QA
+        qa_response = qa_result.get("response", "")
+        is_qa_failed = "STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "FAIL ❌" in qa_response or "CRITICAL" in qa_response
+
+        if is_qa_failed:
+            print("\n[STAGE 4.1] ⚠️ QA flagged test failures/adversarial defects. Invoking dev-agent to remediate...")
+            remediation_payload = {
+                "repository": {"full_name": repo},
+                "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
+                "comment": {"body": f"Please fix the following QA defects and adversarial test failures:\n\n{qa_response}"},
+            }
+            remed_qa_result = await self.handle_dev_agent(repo, remediation_payload)
+            pipeline_summary["stages"]["qa_remediation"] = remed_qa_result
+
+            # Re-run QA post-remediation
+            print("[STAGE 4.2] 🧪 Re-running QA verification post-remediation...")
+            qa_result = await self.handle_qa_agent(repo, pr_payload)
+            pipeline_summary["stages"]["qa_agent_recheck"] = qa_result
+            qa_response = qa_result.get("response", "")
+            is_qa_failed = "STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "FAIL ❌" in qa_response
+
         # -------------------------------------------------------------
         # STAGE 5: Principal Architect Review & Sign-off (senior-reviewer-agent)
         # -------------------------------------------------------------
@@ -237,24 +262,41 @@ class EventRouter:
         reviewer_result = await self.handle_senior_reviewer_agent(repo, pr_payload)
         pipeline_summary["stages"]["senior_reviewer_agent"] = reviewer_result
 
-        # Mark PR ready for human merge
+        # Final dynamic gate statuses
+        sec_status_icon = "STATUS: BLOCKED ❌" if is_sec_blocked else "STATUS: PASSED ✅"
+        qa_status_icon = "STATUS: FAILED ❌" if is_qa_failed else "STATUS: PASSED ✅"
+        all_passed = (not is_sec_blocked) and (not is_qa_failed)
+
         if not self.dry_run and pr_number and repo:
-            await self.github_client.add_labels(repo, pr_number, ["ready-for-merge", "status:approved"])
-            final_comment = (
-                f"## 🚀 Autonomous 5-Agent SDLC Pipeline Complete!\n\n"
-                f"All quality and compliance gates have succeeded:\n"
-                f"- 🎯 **`pm-agent`**: User Story & Gherkin specifications accepted.\n"
-                f"- 🧑‍💻 **`dev-agent`**: Code and 100% unit tests authored on branch `{branch_name}`.\n"
-                f"- 🛡️ **`security-agent`**: Multi-tenant isolation & secrets audit passed (`STATUS: PASSED ✅`).\n"
-                f"- 🧪 **`qa-agent`**: Adversarial edge cases & regression tests passed (`100% PASS ✅`).\n"
-                f"- 🧙‍♂️ **`senior-reviewer-agent`**: ADR compliance validated and PR **APPROVED (`LGTM ✅`)**.\n\n"
-                f"👉 **Human Sign-Off Gate**: Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number}) is ready for your final merge!"
-            )
+            if all_passed:
+                await self.github_client.add_labels(repo, pr_number, ["ready-for-merge", "status:approved"])
+                final_comment = (
+                    f"## 🚀 Autonomous 5-Agent SDLC Pipeline Complete!\n\n"
+                    f"All quality and compliance gates have succeeded:\n"
+                    f"- 🎯 **`pm-agent`**: User Story & Gherkin specifications accepted.\n"
+                    f"- 🧑‍💻 **`dev-agent`**: Code and unit tests authored on branch `{branch_name}`.\n"
+                    f"- 🛡️ **`security-agent`**: Multi-tenant isolation & secrets audit ({sec_status_icon}).\n"
+                    f"- 🧪 **`qa-agent`**: Adversarial edge cases & regression tests ({qa_status_icon}).\n"
+                    f"- 🧙‍♂️ **`senior-reviewer-agent`**: ADR compliance validated and PR **APPROVED (`LGTM ✅`)**.\n\n"
+                    f"👉 **Human Sign-Off Gate**: Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number}) is ready for your final merge!"
+                )
+            else:
+                await self.github_client.add_labels(repo, pr_number, ["status:changes-requested"])
+                final_comment = (
+                    f"## ⚠️ Autonomous SDLC Pipeline: Quality Gate Action Required\n\n"
+                    f"- 🎯 **`pm-agent`**: User Story & Gherkin specifications accepted.\n"
+                    f"- 🧑‍💻 **`dev-agent`**: Code pushed to branch `{branch_name}`.\n"
+                    f"- 🛡️ **`security-agent`**: {sec_status_icon}.\n"
+                    f"- 🧪 **`qa-agent`**: {qa_status_icon}.\n"
+                    f"- 🧙‍♂️ **`senior-reviewer-agent`**: Review complete (Pending defect resolution).\n\n"
+                    f"👉 **Action Required**: Please inspect findings on Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number})."
+                )
+
             await self.github_client.create_issue_comment(repo, issue_number, final_comment)
 
-        pipeline_summary["status"] = "completed_awaiting_human_merge"
+        pipeline_summary["status"] = "completed_awaiting_human_merge" if all_passed else "action_required"
         print("\n=======================================================")
-        print("✅ AUTONOMOUS PIPELINE COMPLETE (Ready for Human Merge)")
+        print(f"🏁 AUTONOMOUS PIPELINE FINISHED (Status: {pipeline_summary["status"]})")
         print("=======================================================\n")
         return pipeline_summary
 
