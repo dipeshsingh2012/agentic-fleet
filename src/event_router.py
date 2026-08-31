@@ -102,9 +102,12 @@ class EventRouter:
             if added_label == "agent:pm" or "agent:pm" in labels or action == "opened":
                 return await self.handle_pm_agent(repo_name, payload)
 
-        # 2. Issue Comments / Mentions
-        elif event_name in ["issue_comment", "pull_request_review_comment"] and action in ["created", "edited"]:
-            comment_body = payload.get("comment", {}).get("body", "").lower()
+        # 2. Issue Comments / Mentions / PR Reviews
+        elif event_name in ["issue_comment", "pull_request_review_comment", "pull_request_review"] and action in ["created", "edited", "submitted"]:
+            comment_body = (
+                payload.get("comment", {}).get("body", "")
+                or payload.get("review", {}).get("body", "")
+            ).lower()
             if "@fleet" in comment_body or "@autonomous" in comment_body or "run pipeline" in comment_body:
                 return await self.run_autonomous_pipeline(repo_name, payload)
             if "@dev-agent" in comment_body or "dev-agent" in comment_body or "@dev" in comment_body:
