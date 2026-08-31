@@ -93,7 +93,6 @@ class EventRouter:
             added_label = payload.get("label", {}).get("name", "")
             labels = [lbl.get("name", "") for lbl in payload.get("issue", {}).get("labels", [])]
 
-            # When a new issue is opened without single-agent tag, trigger autonomous pipeline
             if "agent:autonomous" in labels or added_label == "agent:autonomous" or (action == "opened" and "agent:pm" not in labels and "agent:ready-for-dev" not in labels):
                 return await self.run_autonomous_pipeline(repo_name, payload)
 
@@ -108,6 +107,7 @@ class EventRouter:
                 payload.get("comment", {}).get("body", "")
                 or payload.get("review", {}).get("body", "")
             ).lower()
+
             if "@fleet" in comment_body or "@autonomous" in comment_body or "run pipeline" in comment_body:
                 return await self.run_autonomous_pipeline(repo_name, payload)
             if "@dev-agent" in comment_body or "dev-agent" in comment_body or "@dev" in comment_body:
@@ -133,7 +133,6 @@ class EventRouter:
             if action in ["opened", "synchronize"] or added_label == "ready-for-security-audit" or "ready-for-security-audit" in pr_labels:
                 return await self.handle_security_agent(repo_name, payload)
 
-        # Default fallback
         return {
             "status": "ignored",
             "reason": f"No agent trigger matched for event '{event_name}' (action: '{action}')",
@@ -156,14 +155,15 @@ class EventRouter:
 
     async def run_autonomous_pipeline(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Smart, stateful SDLC orchestrator with strict QA gate halting:
+        Smart, stateful SDLC orchestrator with strict QA gate halting and stage skip awareness:
         - Inspects current PR & Issue label states.
-        - Automatically drives pending / review / remediation steps forward.
+        - Skips already-passed stages (PM, Dev, Security, QA).
+        - Automatically executes pending / remediation steps.
         - Hard Halt: If QA fails (due to test failures, collection/import errors), halts immediately without running senior reviewer!
         """
         print("\n=======================================================")
         print("🛸 SMART AGENTIC FLEET PIPELINE (Autonomous Orchestration)")
-        print("=======================================================\\n")
+        print("=======================================================\n")
 
         issue_payload = payload.get("issue", {})
         issue_number = issue_payload.get("number", 1)
@@ -231,28 +231,33 @@ class EventRouter:
         # -------------------------------------------------------------
         # STAGE 3: Security & Multi-Tenant Audit (security-agent)
         # -------------------------------------------------------------
-        print(f"\n[STAGE 3/5] 🛡️ Running security-agent for PR #{effective_pr_number}...")
-        sec_result = await self.handle_security_agent(repo, pr_payload)
-        pipeline_summary["stages"]["security_agent"] = sec_result
-
-        sec_response = sec_result.get("response", "")
-        is_sec_blocked = False if self.dry_run else ("STATUS: BLOCKED" in sec_response or "VERDICT: BLOCKED" in sec_response or "STATUS: FAILED" in sec_response)
-
-        if is_sec_blocked:
-            print("\n[STAGE 3.1] ⚠️ Security defects detected. Invoking dev-agent to remediate...")
-            remediation_payload = {
-                "repository": {"full_name": repo},
-                "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
-                "comment": {"body": f"Please fix the following security findings:\n\n{sec_response}"},
-            }
-            remed_result = await self.handle_dev_agent(repo, remediation_payload)
-            pipeline_summary["stages"]["security_remediation"] = remed_result
-
-            print("[STAGE 3.2] 🛡️ Re-auditing security post-remediation...")
+        if "security:passed" in pr_labels and not self.dry_run:
+            print(f"[STAGE 3/5] ⏭️ security-agent: Multi-tenant audit already passed (security:passed). Skipping duplicate review.")
+            pipeline_summary["stages"]["security_agent"] = {"status": "skipped", "verdict": "PASSED"}
+            is_sec_blocked = False
+        else:
+            print(f"\n[STAGE 3/5] 🛡️ Running security-agent for PR #{effective_pr_number}...")
             sec_result = await self.handle_security_agent(repo, pr_payload)
-            pipeline_summary["stages"]["security_agent_recheck"] = sec_result
+            pipeline_summary["stages"]["security_agent"] = sec_result
+
             sec_response = sec_result.get("response", "")
             is_sec_blocked = False if self.dry_run else ("STATUS: BLOCKED" in sec_response or "VERDICT: BLOCKED" in sec_response or "STATUS: FAILED" in sec_response)
+
+            if is_sec_blocked:
+                print("\n[STAGE 3.1] ⚠️ Security defects detected. Invoking dev-agent to remediate...")
+                remediation_payload = {
+                    "repository": {"full_name": repo},
+                    "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
+                    "comment": {"body": f"Please fix the following security findings:\n\n{sec_response}"},
+                }
+                remed_result = await self.handle_dev_agent(repo, remediation_payload)
+                pipeline_summary["stages"]["security_remediation"] = remed_result
+
+                print("[STAGE 3.2] 🛡️ Re-auditing security post-remediation...")
+                sec_result = await self.handle_security_agent(repo, pr_payload)
+                pipeline_summary["stages"]["security_agent_recheck"] = sec_result
+                sec_response = sec_result.get("response", "")
+                is_sec_blocked = False if self.dry_run else ("STATUS: BLOCKED" in sec_response or "VERDICT: BLOCKED" in sec_response or "STATUS: FAILED" in sec_response)
 
         # -------------------------------------------------------------
         # STAGE 4: Adversarial QA & Test Execution (qa-agent & dev remediation)
@@ -275,6 +280,11 @@ class EventRouter:
             pipeline_summary["stages"]["qa_agent"] = qa_result
             qa_response = qa_result.get("response", "")
             is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
+
+        elif "qa:passed" in pr_labels and not self.dry_run and not is_sec_blocked:
+            print(f"[STAGE 4/5] ⏭️ qa-agent: QA verification already passed (qa:passed). Skipping duplicate review.")
+            pipeline_summary["stages"]["qa_agent"] = {"status": "skipped", "verdict": "PASSED"}
+            is_qa_failed = False
 
         else:
             print(f"\n[STAGE 4/5] 🧪 Running qa-agent for PR #{effective_pr_number}...")
@@ -299,6 +309,7 @@ class EventRouter:
                 pipeline_summary["stages"]["qa_agent_recheck"] = qa_result
                 qa_response = qa_result.get("response", "")
                 is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
+
         # HARD GATE: If QA failed due to collection errors or test failures, HALT PIPELINE IMMEDIATELY!
         if is_qa_failed:
             print("\n[HALT] 🛑 QA verification failed (test collection/execution/edge case error). Halting pipeline before Senior Reviewer.")
@@ -320,9 +331,13 @@ class EventRouter:
         # -------------------------------------------------------------
         # STAGE 5: Principal Architect Review & Sign-off (senior-reviewer-agent)
         # -------------------------------------------------------------
-        print(f"\n[STAGE 5/5] 🧙‍♂️ Running senior-reviewer-agent (ADR Audit & Approval)...")
-        reviewer_result = await self.handle_senior_reviewer_agent(repo, pr_payload)
-        pipeline_summary["stages"]["senior_reviewer_agent"] = reviewer_result
+        if "status:approved" in pr_labels and "ready-for-merge" in pr_labels and not is_sec_blocked and not is_qa_failed and not self.dry_run:
+            print(f"[STAGE 5/5] ⏭️ senior-reviewer-agent: PR #{effective_pr_number} already APPROVED. Skipping duplicate review.")
+            pipeline_summary["stages"]["senior_reviewer_agent"] = {"status": "skipped", "verdict": "APPROVED"}
+        else:
+            print(f"\n[STAGE 5/5] 🧙‍♂️ Running senior-reviewer-agent (ADR Audit & Approval)...")
+            reviewer_result = await self.handle_senior_reviewer_agent(repo, pr_payload)
+            pipeline_summary["stages"]["senior_reviewer_agent"] = reviewer_result
 
         sec_status_icon = "STATUS: BLOCKED ❌" if is_sec_blocked else "STATUS: PASSED ✅"
         qa_status_icon = "STATUS: PASSED ✅"
