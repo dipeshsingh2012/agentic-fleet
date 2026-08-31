@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import re
-import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -56,7 +55,6 @@ class EventRouter:
     def _materialize_code_files(self, workspace_dir: Path, content: str) -> Dict[str, str]:
         """Extract and write all source and test code blocks into real repository files."""
         files: Dict[str, str] = {}
-        has_backend_dir = (workspace_dir / "backend").exists() and (workspace_dir / "backend").is_dir()
 
         # Pattern 1: ```lang:path/to/file.ext\ncode\n```
         p1 = re.compile(r"```[a-zA-Z0-9_\-\.]*:([a-zA-Z0-9_\-\.\/]+)\n(.*?)```", re.DOTALL)
@@ -79,31 +77,14 @@ class EventRouter:
                 if path_clean not in files and not path_clean.endswith(".md"):
                     files[path_clean] = code
 
-        # Normalize and write each extracted file to disk
-        materialized: Dict[str, str] = {}
+        # Write each extracted file to disk in workspace_dir
         for rel_path, file_code in files.items():
-            # If repo has backend/ structure and path starts with app/ or tests/, prefix with backend/
-            target_rel = rel_path
-            if has_backend_dir and not target_rel.startswith("backend/") and (target_rel.startswith("app/") or target_rel.startswith("tests/")):
-                target_rel = f"backend/{target_rel}"
-
-            target_path = workspace_dir / target_rel
+            target_path = workspace_dir / rel_path
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(file_code.strip() + "\n", encoding="utf-8")
-            materialized[target_rel] = file_code
-            print(f"[DEV-AGENT] 📝 Materialized file ({len(file_code)} chars): {target_rel}")
+            print(f"[DEV-AGENT] 📝 Materialized file ({len(file_code)} chars): {rel_path}")
 
-        # Clean up misplaced root-level folders if backend/ exists
-        if has_backend_dir:
-            for root_dir in ["app", "tests"]:
-                root_path = workspace_dir / root_dir
-                if root_path.exists() and root_path.is_dir() and (workspace_dir / "backend" / root_dir).exists():
-                    try:
-                        shutil.rmtree(root_path)
-                    except Exception:
-                        pass
-
-        return materialized
+        return files
 
     async def _get_pr_diff_safe(self, repo: str, pr_number: int) -> str:
         """Fetch PR diff via GitHub API or local git fallback."""
@@ -322,7 +303,7 @@ class EventRouter:
             remediation_payload = {
                 "repository": {"full_name": repo},
                 "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
-                "comment": {"body": "Address previous QA verification and adversarial test findings: write real python files under backend/app/ and backend/tests/, resolve pytest collection error, escape CSV formulas by stripping whitespace, sanitize Content-Disposition header against path traversal, and use Header(alias='X-Tenant-ID')."},
+                "comment": {"body": "Address previous QA verification and adversarial test findings: extract and write code to real python files (app/services/csv_service.py, tests/test_csv_service.py), resolve pytest collection error, escape CSV formulas by stripping whitespace, sanitize Content-Disposition header against path traversal, and use Header(alias='X-Tenant-ID')."},
             }
             remed_qa_result = await self.handle_dev_agent(repo, remediation_payload)
             pipeline_summary["stages"]["qa_remediation"] = remed_qa_result
@@ -473,10 +454,10 @@ class EventRouter:
             user_input = (
                 f"Address review and audit feedback on Pull Request #{pr_number} for branch `{branch_name}`.\n\n"
                 f"Reviewer Feedback:\n{comment_body}\n\n"
-                f"Implement all required remediations, place files under backend/app/ and backend/tests/, and output all code blocks using ```python:backend/path/to/file.py."
+                f"Implement all required remediations, extract and output all python source and test files using ```python:path/to/file.py blocks."
             )
         else:
-            user_input = f"Implement specification for Issue #{issue_number}: {issue_title}\n\n{issue_body}\n\nOutput all files in ```python:backend/path/to/file.py blocks."
+            user_input = f"Implement specification for Issue #{issue_number}: {issue_title}\n\n{issue_body}\n\nOutput all files in ```python:path/to/file.py blocks."
 
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
@@ -636,11 +617,7 @@ class EventRouter:
         effective_pr_number = pr_number or 1
         diff_content = await self._get_pr_diff_safe(repo, effective_pr_number)
 
-        # Smart test execution: if backend/ directory exists, run pytest inside backend or target backend/tests
-        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
-        test_cmd = "pytest -v backend/tests" if (workspace_dir / "backend").exists() else "pytest -v"
-
-        test_res = await self.test_harness.run_command(test_cmd) if not self.dry_run else None
+        test_res = await self.test_harness.run_command("pytest -v") if not self.dry_run else None
         total = test_res.total_tests if test_res and test_res.total_tests > 0 else 15
         passed = test_res.passed_tests if test_res and test_res.passed_tests > 0 else 15
         failed = test_res.failed_tests if test_res else 0
@@ -659,7 +636,7 @@ class EventRouter:
         )
         user_input = (
             f"Adversarial QA validation for PR #{effective_pr_number}.\n\n"
-            f"### Automated Test Execution Results ({test_cmd}):\n"
+            f"### Automated Test Execution Results:\n"
             f"- Total: {total} | Passed: {passed} | Failed: {failed} | Duration: {duration}s\n"
             f"- Output:\n```\n{stdout_snippet[:800]}\n```\n\n"
             f"### Pull Request Code Diff:\n```diff\n{diff_content}\n```"
