@@ -42,6 +42,25 @@ class EventRouter:
             return json.loads(path.read_text(encoding="utf-8"))
         return {}
 
+    async def _get_pr_diff_safe(self, repo: str, pr_number: int) -> str:
+        """Fetch PR diff via GitHub API or local git fallback."""
+        if not self.dry_run and repo and pr_number:
+            try:
+                diff = await self.github_client.get_pr_diff(repo, pr_number)
+                if diff.strip():
+                    return diff
+            except Exception as e:
+                print(f"[WARN] Failed to fetch PR diff via GitHub API: {e}")
+
+        try:
+            res = await self.test_harness.run_command("git diff origin/main...HEAD")
+            if res.is_success and res.stdout.strip():
+                return res.stdout
+        except Exception:
+            pass
+
+        return "(No code changes detected or synthetic diff)"
+
     def _extract_pr_number(self, payload: Dict[str, Any]) -> Optional[int]:
         """Safely extract PR number whether event is pull_request or issue_comment on a PR."""
         if "pull_request" in payload and isinstance(payload["pull_request"], dict):
@@ -261,13 +280,16 @@ class EventRouter:
             return {"status": "ignored", "reason": "No PR number found for security review"}
 
         effective_pr_number = pr_number or 1
-        files_inspected = "All modified files in pull request"
+        diff_content = await self._get_pr_diff_safe(repo, effective_pr_number)
 
         prompt = self.llm_runner.load_prompt(
             "security-agent",
-            {"pr_number": effective_pr_number, "files_inspected": files_inspected},
+            {"pr_number": effective_pr_number, "files_inspected": "All modified files in pull request"},
         )
-        user_input = f"Perform multi-tenant and secret audit for PR #{effective_pr_number}"
+        user_input = (
+            f"Perform multi-tenant and secret audit for Pull Request #{effective_pr_number}.\n\n"
+            f"### Code Changes & Git Diff:\n```diff\n{diff_content}\n```"
+        )
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
         if not self.dry_run and pr_number and repo:
@@ -353,9 +375,13 @@ class EventRouter:
             return {"status": "ignored", "reason": "No PR number found for architectural review"}
 
         effective_pr_number = pr_number or 1
+        diff_content = await self._get_pr_diff_safe(repo, effective_pr_number)
 
         prompt = self.llm_runner.load_prompt("senior-reviewer-agent", {"pr_number": effective_pr_number})
-        user_input = f"Principal Architect review and ADR compliance audit for PR #{effective_pr_number}"
+        user_input = (
+            f"Principal Architect review and ADR compliance audit for Pull Request #{effective_pr_number}.\n\n"
+            f"### Code Changes & Git Diff:\n```diff\n{diff_content}\n```"
+        )
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run)
 
         if not self.dry_run and pr_number and repo:
