@@ -4,9 +4,12 @@ GitHub REST API client for agentic-fleet orchestration.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict, List, Optional
 import httpx
+
+logger = logging.getLogger("agentic-fleet.github_client")
 
 
 class GitHubClient:
@@ -20,7 +23,7 @@ class GitHubClient:
             "User-Agent": "agentic-fleet-orchestrator",
         }
         if self.token:
-            self.headers["Authorization"] = f"token {self.token}"
+            self.headers["Authorization"] = f"Bearer {self.token}"
 
     def _get_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(base_url=self.base_url, headers=self.headers, timeout=30.0)
@@ -39,6 +42,8 @@ class GitHubClient:
                 f"/repos/{repo}/issues/{issue_number}/comments",
                 json={"body": body},
             )
+            if resp.status_code not in [200, 201]:
+                print(f"[ERROR] create_issue_comment failed: HTTP {resp.status_code}: {resp.text}")
             resp.raise_for_status()
             return resp.json()
 
@@ -49,6 +54,8 @@ class GitHubClient:
                 f"/repos/{repo}/issues/{issue_number}/labels",
                 json={"labels": labels},
             )
+            if resp.status_code not in [200, 201]:
+                print(f"[ERROR] add_labels failed: HTTP {resp.status_code}: {resp.text}")
             resp.raise_for_status()
             return resp.json()
 
@@ -77,6 +84,19 @@ class GitHubClient:
             resp.raise_for_status()
             return resp.text
 
+    async def find_existing_pr(self, repo: str, head_branch: str) -> Optional[Dict[str, Any]]:
+        """Find an existing open PR by head branch."""
+        async with self._get_client() as client:
+            owner = repo.split("/")[0] if "/" in repo else ""
+            query_heads = [head_branch, f"{owner}:{head_branch}"] if owner else [head_branch]
+            for h in query_heads:
+                resp = await client.get(f"/repos/{repo}/pulls", params={"head": h, "state": "open"})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        return data[0]
+            return None
+
     async def create_pull_request(
         self,
         repo: str,
@@ -86,12 +106,34 @@ class GitHubClient:
         body: str = "",
         draft: bool = False,
     ) -> Dict[str, Any]:
-        """Create a new pull request."""
+        """Create a new pull request with automatic owner prefixing and existing PR detection."""
         async with self._get_client() as client:
-            resp = await client.post(
-                f"/repos/{repo}/pulls",
-                json={"title": title, "head": head, "base": base, "body": body, "draft": draft},
-            )
+            payload = {"title": title, "head": head, "base": base, "body": body, "draft": draft}
+            print(f"[INFO] Calling GitHub API POST /repos/{repo}/pulls (head: '{head}', base: '{base}')")
+            resp = await client.post(f"/repos/{repo}/pulls", json=payload)
+
+            if resp.status_code in [200, 201]:
+                return resp.json()
+
+            print(f"[WARN] First PR creation attempt failed: HTTP {resp.status_code}: {resp.text}")
+
+            # Try prefixing head with owner (e.g. dipeshsingh2012:feat/...)
+            if ":" not in head and "/" in repo:
+                owner = repo.split("/")[0]
+                namespaced_head = f"{owner}:{head}"
+                payload["head"] = namespaced_head
+                print(f"[INFO] Retrying with namespaced head: '{namespaced_head}'")
+                retry_resp = await client.post(f"/repos/{repo}/pulls", json=payload)
+                if retry_resp.status_code in [200, 201]:
+                    return retry_resp.json()
+                print(f"[WARN] Namespaced PR retry failed: HTTP {retry_resp.status_code}: {retry_resp.text}")
+
+            # Check if PR already exists for this branch
+            existing_pr = await self.find_existing_pr(repo, head)
+            if existing_pr:
+                print(f"[INFO] Found existing open PR #{existing_pr.get('number')} for branch '{head}'")
+                return existing_pr
+
             resp.raise_for_status()
             return resp.json()
 

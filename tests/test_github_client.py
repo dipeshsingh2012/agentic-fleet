@@ -7,7 +7,7 @@ from src.github_client import GitHubClient
 async def test_github_client_init():
     client = GitHubClient(token="mock-token")
     assert client.token == "mock-token"
-    assert "token mock-token" in client.headers["Authorization"]
+    assert "Bearer mock-token" in client.headers["Authorization"]
 
 
 @pytest.mark.asyncio
