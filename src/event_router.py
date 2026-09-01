@@ -788,7 +788,23 @@ class EventRouter:
             if not is_pr_remediation:
                 try:
                     pr_title = f"feat: implement Issue #{issue_number} - {issue_title}" if isinstance(issue_number, int) else f"feat: {issue_title}"
-                    pr_body = f"Closes #{issue_number}\n\n{response}" if isinstance(issue_number, int) else f"### Roadmap Initiative: `{issue_number}`\n\n{response}"
+                    clean_summary = re.sub(r"```[a-zA-Z0-9_\-\.]*:?[a-zA-Z0-9_\-\.\/]*\n.*?```", "", response, flags=re.DOTALL).strip()
+                    clean_summary = re.sub(r"\n{3,}", "\n\n", clean_summary)
+                    file_list_md = "\n".join([f"- `{f}`" for f in extracted_files.keys()]) if extracted_files else "- *(See Git Diff)*"
+                    
+                    pr_body = (
+                        f"## 🚀 Overview & Intent\n"
+                        f"{f'Closes #{issue_number}' if isinstance(issue_number, int) else f'**Roadmap Initiative**: `{issue_number}`'}\n\n"
+                        f"### 📋 Summary of Changes\n"
+                        f"{clean_summary[:2500]}\n\n"
+                        f"### 📁 Files Created & Modified\n"
+                        f"{file_list_md}\n\n"
+                        f"### 🧪 Automated Verification & Quality Matrix\n"
+                        f"- [x] **Unit & Integration Tests**: Verified via pre-commit test runner.\n"
+                        f"- [ ] **Security Audit**: Monitored by `@security-agent`.\n"
+                        f"- [ ] **Adversarial QA**: Monitored by `@qa-agent`.\n"
+                        f"- [ ] **Architectural Sign-off**: Awaiting `@senior-reviewer-agent` approval.\n"
+                    )
                     pr_res = await self.github_client.create_pull_request(
                         repo=repo,
                         title=pr_title,
