@@ -111,16 +111,19 @@ class GitHubClient:
             return resp.text
 
     async def find_existing_pr(self, repo: str, head_branch: str) -> Optional[Dict[str, Any]]:
-        """Find an existing open PR by head branch."""
+        """Find an existing open PR by head branch, strictly verifying branch name match."""
         async with self._get_client() as client:
             owner = repo.split("/")[0] if "/" in repo else ""
-            query_heads = [head_branch, f"{owner}:{head_branch}"] if owner else [head_branch]
+            query_heads = [f"{owner}:{head_branch}", head_branch] if owner else [head_branch]
             for h in query_heads:
                 resp = await client.get(f"/repos/{repo}/pulls", params={"head": h, "state": "open"})
                 if resp.status_code == 200:
                     data = resp.json()
                     if isinstance(data, list) and len(data) > 0:
-                        return data[0]
+                        for pr in data:
+                            ref = pr.get("head", {}).get("ref", "")
+                            if ref == head_branch:
+                                return pr
             return None
 
     async def create_pull_request(
