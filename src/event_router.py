@@ -366,6 +366,34 @@ class EventRouter:
             if action in ["opened", "synchronize"] or added_label == "ready-for-security-audit" or "ready-for-security-audit" in pr_labels:
                 return await self.handle_security_agent(repo_name, payload)
 
+        # 4. Repository Dispatch Events (Autonomous MCP / Zero-Issue Fleet Dispatch)
+        elif event_name == "repository_dispatch":
+            action_type = payload.get("action", "") or payload.get("event_type", "")
+            client_payload = payload.get("client_payload", {})
+            title = client_payload.get("title") or "Autonomous Feature Initiative"
+            initiative_id = client_payload.get("initiative_id") or "mcp-initiative"
+            feedback = client_payload.get("feedback") or ""
+            prompt_text = client_payload.get("prompt") or feedback or title
+
+            print(f"[EVENT ROUTER] ⚡ Processing repository_dispatch: action='{action_type}', initiative='{initiative_id}', title='{title}'")
+
+            synthetic_issue = {
+                "number": initiative_id,
+                "title": title,
+                "body": prompt_text,
+                "labels": [{"name": "agent:autonomous"}, {"name": "source:mcp"}]
+            }
+            dispatch_payload = {
+                **payload,
+                "issue": synthetic_issue,
+                "client_payload": client_payload,
+            }
+
+            if action_type in ["mcp_initiative", "mcp_spec"]:
+                return await self.handle_pm_agent(repo_name, dispatch_payload)
+            else:
+                return await self.run_autonomous_pipeline(repo_name, dispatch_payload)
+
         return {
             "status": "ignored",
             "reason": f"No agent trigger matched for event '{event_name}' (action: '{action}')",
@@ -471,7 +499,9 @@ class EventRouter:
                     f"1. Ensure **'Allow GitHub Actions to create and approve pull requests'** is enabled in repository settings (`Settings` -> `Actions` -> `General` -> `Workflow permissions`).\n"
                     f"2. Or manually open a Pull Request from branch `{branch_name}`."
                 )
-                await self.github_client.create_issue_comment(repo, issue_number, halt_comment)
+                target_comment_id = pr_number or (issue_number if isinstance(issue_number, int) else None)
+            if target_comment_id:
+                await self.github_client.create_issue_comment(repo, target_comment_id, halt_comment)
             return pipeline_summary
 
         effective_pr_number = pr_number or 1
@@ -558,7 +588,9 @@ class EventRouter:
                     f"⛔ **Pipeline Halted**: `senior-reviewer-agent` will not run until all test errors and collection issues are resolved.\n\n"
                     f"👉 Please inspect and resolve failures on Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number})."
                 )
-                await self.github_client.create_issue_comment(repo, issue_number, halt_comment)
+                target_comment_id = pr_number or (issue_number if isinstance(issue_number, int) else None)
+            if target_comment_id:
+                await self.github_client.create_issue_comment(repo, target_comment_id, halt_comment)
             return pipeline_summary
 
         # -------------------------------------------------------------
@@ -587,7 +619,9 @@ class EventRouter:
                 f"- 🧙‍♂️ **`senior-reviewer-agent`**: ADR compliance validated and PR **APPROVED (`LGTM ✅`)**.\n\n"
                 f"👉 **Human Sign-Off Gate**: Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number}) is ready for your final merge!"
             )
-            await self.github_client.create_issue_comment(repo, issue_number, final_comment)
+            target_comment_id = pr_number or (issue_number if isinstance(issue_number, int) else None)
+            if target_comment_id:
+                await self.github_client.create_issue_comment(repo, target_comment_id, final_comment)
 
         pipeline_summary["status"] = "completed_awaiting_human_merge"
         print("\n=======================================================")
@@ -616,7 +650,7 @@ class EventRouter:
         user_input = f"{context_block}\n\nPlease author the user story, Gherkin acceptance criteria, and RICE score for Issue #{issue_number}."
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="fast")
 
-        if not self.dry_run and issue_number and repo:
+        if not self.dry_run and isinstance(issue_number, int) and repo:
             await self.github_client.create_issue_comment(repo, issue_number, response)
             await self.github_client.remove_label(repo, issue_number, "agent:pm")
             await self.github_client.add_labels(repo, issue_number, ["agent:ready-for-dev"])
@@ -753,12 +787,14 @@ class EventRouter:
 
             if not is_pr_remediation:
                 try:
+                    pr_title = f"feat: implement Issue #{issue_number} - {issue_title}" if isinstance(issue_number, int) else f"feat: {issue_title}"
+                    pr_body = f"Closes #{issue_number}\n\n{response}" if isinstance(issue_number, int) else f"### Roadmap Initiative: `{issue_number}`\n\n{response}"
                     pr_res = await self.github_client.create_pull_request(
                         repo=repo,
-                        title=f"feat: implement Issue #{issue_number} - {issue_title}",
+                        title=pr_title,
                         head=branch_name,
                         base="main",
-                        body=f"Closes #{issue_number}\n\n{response}",
+                        body=pr_body,
                     )
                     created_pr_number = pr_res.get("number")
                 except Exception as e:
@@ -783,8 +819,9 @@ class EventRouter:
                     f"Pushed branch `{branch_name}`."
                 )
 
-            target_id = created_pr_number if is_pr_remediation else issue_number
-            await self.github_client.create_issue_comment(repo, target_id, comment_body)
+            target_id = created_pr_number if created_pr_number else (issue_number if isinstance(issue_number, int) else None)
+            if target_id:
+                await self.github_client.create_issue_comment(repo, target_id, comment_body)
 
         return {
             "agent": "dev-agent",
