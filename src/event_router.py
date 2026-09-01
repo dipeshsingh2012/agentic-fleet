@@ -448,6 +448,21 @@ class EventRouter:
             pr_number = dev_result.get("pr_number")
             branch_name = dev_result.get("branch_name", branch_name)
 
+        if not pr_number and not self.dry_run:
+            print(f"\n[HALT] 🛑 dev-agent could not open a Pull Request for branch `{branch_name}`. Halting pipeline.")
+            pipeline_summary["status"] = "pr_creation_failed_halted"
+            if issue_number and repo:
+                halt_comment = (
+                    f"## ⚠️ Autonomous Pipeline Halted: Pull Request Creation Required\n\n"
+                    f"- 🎯 **`pm-agent`**: Specification generated.\n"
+                    f"- 🧑‍💻 **`dev-agent`**: Materialized files on branch `{branch_name}`.\n\n"
+                    f"⛔ **Action Required**: The automated Pull Request could not be created automatically.\n"
+                    f"1. Ensure **'Allow GitHub Actions to create and approve pull requests'** is enabled in repository settings (`Settings` -> `Actions` -> `General` -> `Workflow permissions`).\n"
+                    f"2. Or manually open a Pull Request from branch `{branch_name}`."
+                )
+                await self.github_client.create_issue_comment(repo, issue_number, halt_comment)
+            return pipeline_summary
+
         effective_pr_number = pr_number or 1
         pr_payload = {
             "repository": {"full_name": repo},
