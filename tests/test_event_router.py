@@ -184,3 +184,36 @@ async def test_route_review_failure_to_dev():
     result = await router.route_event("pull_request_review", payload)
     assert result["agent"] == "dev-agent"
     assert result["action"] == "remediated_pr"
+
+
+@pytest.mark.asyncio
+async def test_route_untagged_human_comment_to_fleet():
+    router = EventRouter(dry_run=True)
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "dipeshsingh2012/rfqengine"},
+        "issue": {"number": 15, "title": "Implement Feature"},
+        "comment": {
+            "body": "Please make sure to add SSE transport support too.",
+            "user": {"login": "dipeshsingh2012"},
+        },
+    }
+    result = await router.route_event("issue_comment", payload)
+    assert result["pipeline"] == "autonomous-5-agent-sdlc"
+
+
+@pytest.mark.asyncio
+async def test_ignore_bot_comments():
+    router = EventRouter(dry_run=True)
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "dipeshsingh2012/rfqengine"},
+        "issue": {"number": 15, "title": "Implement Feature"},
+        "comment": {
+            "body": "## 🚀 Autonomous 5-Agent SDLC Pipeline: Ready for Merge",
+            "user": {"login": "github-actions[bot]"},
+        },
+    }
+    result = await router.route_event("issue_comment", payload)
+    assert result["status"] == "ignored"
+    assert "bot user" in result["reason"]

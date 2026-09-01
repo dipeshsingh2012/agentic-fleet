@@ -311,6 +311,13 @@ class EventRouter:
 
         # 2. Issue Comments / Mentions / PR Reviews
         elif event_name in ["issue_comment", "pull_request_review_comment", "pull_request_review"] and action in ["created", "edited", "submitted"]:
+            comment_obj = payload.get("comment", {}) or payload.get("review", {})
+            author = comment_obj.get("user", {}).get("login", "")
+            
+            # Avoid self-triggering infinite loops on bot comments
+            if author.endswith("[bot]") or author in ["github-actions[bot]", "agentic-fleet"]:
+                return {"status": "ignored", "reason": f"Ignored comment from bot user '{author}'"}
+
             comment_body = (
                 payload.get("comment", {}).get("body", "")
                 or payload.get("review", {}).get("body", "")
@@ -342,6 +349,10 @@ class EventRouter:
                 return await self.handle_qa_agent(repo_name, payload)
             if "@senior-reviewer-agent" in comment_body or "@reviewer" in comment_body:
                 return await self.handle_senior_reviewer_agent(repo_name, payload)
+
+            # 4. Default for all human comments: engage smart autonomous fleet!
+            print(f"[EVENT ROUTER] 🛸 Human comment by @{author or 'user'} received. Engaging autonomous fleet orchestrator...")
+            return await self.run_autonomous_pipeline(repo_name, payload)
 
         # 3. Pull Request Events
         elif event_name == "pull_request":
