@@ -676,25 +676,8 @@ class EventRouter:
             arch_result = await self.handle_architect_agent(repo, payload)
             pipeline_summary["stages"]["architect_agent"] = arch_result
 
-            # Closed-Loop Design Self-Healing: if changes are requested, invoke Dev Agent to revise docs/design/!
-            max_design_remediations = int(os.getenv("MAX_DESIGN_REMEDIATIONS", "3"))
-            iteration = 1
-            while arch_result.get("verdict") == "CHANGES_REQUESTED" and iteration <= max_design_remediations:
-                print(f"\n[STAGE 3.{iteration}] ⚠️ Architect requested design changes (Iteration {iteration}/{max_design_remediations}). Invoking dev-agent to revise design document...")
-                revision_payload = {
-                    **payload,
-                    "architect_feedback": arch_result.get("response", ""),
-                }
-                dev_design_result = await self.handle_dev_design(repo, revision_payload)
-                pipeline_summary["stages"][f"dev_design_revision_{iteration}"] = dev_design_result
-
-                print(f"[STAGE 3.{iteration}b] 🏛️ Re-auditing revised design document...")
-                arch_result = await self.handle_architect_agent(repo, payload)
-                pipeline_summary["stages"][f"architect_agent_recheck_{iteration}"] = arch_result
-                iteration += 1
-
-            if arch_result.get("verdict") == "CHANGES_REQUESTED" and not self.dry_run:
-                print("\n[HALT] 🛑 architect-agent design changes could not be resolved after max remediation attempts. Halting pipeline.")
+            if arch_result.get("verdict") == "CHANGES_REQUESTED":
+                print("\n[HALT] 🛑 architect-agent design changes requested. Halting pipeline to allow discrete dev-design revision.")
                 pipeline_summary["status"] = "design_changes_requested"
                 return pipeline_summary
 
@@ -765,7 +748,7 @@ class EventRouter:
             pr_labels = [l for l in pr_labels if l not in ["security:passed", "qa:passed", "status:approved", "ready-for-merge"]]
 
         # -------------------------------------------------------------
-        # STAGE 5: Security & Multi-Tenant Audit (security-agent)
+        # STAGE 5: Security & Multi-Tenant Audit (security-agent Gate 2)
         # -------------------------------------------------------------
         if "security:passed" in pr_labels and not self.dry_run:
             print(f"[STAGE 5/6] ⏭️ security-agent: Multi-tenant audit already passed (security:passed). Skipping duplicate review.")
@@ -780,23 +763,12 @@ class EventRouter:
             is_sec_blocked = False if self.dry_run else ("STATUS: BLOCKED" in sec_response or "VERDICT: BLOCKED" in sec_response or "STATUS: FAILED" in sec_response)
 
             if is_sec_blocked:
-                print("\n[STAGE 5.1] ⚠️ Security defects detected. Invoking dev-agent to remediate...")
-                remediation_payload = {
-                    "repository": {"full_name": repo},
-                    "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
-                    "comment": {"body": f"Please fix the following security findings:\n\n{sec_response}"},
-                }
-                remed_result = await self.handle_dev_agent(repo, remediation_payload)
-                pipeline_summary["stages"]["security_remediation"] = remed_result
-
-                print("[STAGE 5.2] 🛡️ Re-auditing security post-remediation...")
-                sec_result = await self.handle_security_agent(repo, pr_payload)
-                pipeline_summary["stages"]["security_agent_recheck"] = sec_result
-                sec_response = sec_result.get("response", "")
-                is_sec_blocked = False if self.dry_run else ("STATUS: BLOCKED" in sec_response or "VERDICT: BLOCKED" in sec_response or "STATUS: FAILED" in sec_response)
+                print("\n[HALT] 🛑 Security defects detected. Halting pipeline to allow discrete dev-agent remediation.")
+                pipeline_summary["status"] = "security_blocked_halted"
+                return pipeline_summary
 
         # -------------------------------------------------------------
-        # STAGE 5b: Adversarial QA & Test Execution (qa-agent & dev remediation)
+        # STAGE 5b: Adversarial QA & Test Execution (qa-agent Gate 3)
         # -------------------------------------------------------------
         if "qa:passed" in pr_labels and not self.dry_run and not is_sec_blocked:
             print(f"[STAGE 5.3] ⏭️ qa-agent: QA verification already passed (qa:passed). Skipping duplicate review.")
@@ -811,42 +783,9 @@ class EventRouter:
             is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
 
             if is_qa_failed:
-                print("\n[STAGE 5.4] ⚠️ QA defects / test failures detected. Invoking dev-agent to remediate on branch...")
-                remediation_payload = {
-                    "repository": {"full_name": repo},
-                    "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
-                    "comment": {"body": f"Please fix the following QA defects, test collection errors, and adversarial failures:\n\n{qa_response}"},
-                }
-                remed_qa_result = await self.handle_dev_agent(repo, remediation_payload)
-                pipeline_summary["stages"]["qa_remediation"] = remed_qa_result
-
-                print("[STAGE 5.5] 🧪 Re-running QA verification post-remediation...")
-                qa_result = await self.handle_qa_agent(repo, pr_payload)
-                pipeline_summary["stages"]["qa_agent_recheck"] = qa_result
-                qa_response = qa_result.get("response", "")
-                is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
-
-        # HARD GATE: If QA failed due to collection errors or test failures, HALT PIPELINE IMMEDIATELY!
-        if is_qa_failed:
-            print("\n[HALT] 🛑 QA verification failed (test collection/execution/edge case error). Halting pipeline before Senior Reviewer.")
-            pipeline_summary["status"] = "qa_failed_halted"
-            if not self.dry_run and pr_number and repo:
-                await self.github_client.add_labels(repo, pr_number, ["qa:failed", "status:changes-requested"])
-                halt_comment = (
-                    f"## 🛑 Autonomous Pipeline Halted: QA Test Execution / Collection Failed\n\n"
-                    f"- 🎯 **`pm-agent`**: Specification accepted.\n"
-                    f"- 📐 **`dev-agent`**: Design document authored.\n"
-                    f"- 🏛️ **`architect-agent`**: Design approved.\n"
-                    f"- 🧑‍💻 **`dev-agent`**: Implementation pushed to `{branch_name}`.\n"
-                    f"- 🛡️ **`security-agent`**: Security audit complete.\n"
-                    f"- 🧪 **`qa-agent`**: **STATUS: FAILED ❌** (Test collection or execution errors detected).\n\n"
-                    f"⛔ **Pipeline Halted**: `senior-reviewer-agent` will not run until all test errors and collection issues are resolved.\n\n"
-                    f"👉 Please inspect and resolve failures on Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number})."
-                )
-                target_comment_id = pr_number or (issue_number if isinstance(issue_number, int) else None)
-            if target_comment_id:
-                await self.github_client.create_issue_comment(repo, target_comment_id, halt_comment)
-            return pipeline_summary
+                print("\n[HALT] 🛑 QA verification failed. Halting pipeline to allow discrete dev-agent remediation.")
+                pipeline_summary["status"] = "qa_failed_halted"
+                return pipeline_summary
 
         # -------------------------------------------------------------
         # STAGE 6: Principal Architect Review & Sign-off (senior-reviewer-agent)
