@@ -110,6 +110,15 @@ class GitHubClient:
             resp.raise_for_status()
             return resp.text
 
+    async def get_pull_request_files(self, repo: str, pr_number: int) -> List[Dict[str, Any]]:
+        """Get list of files modified in a pull request."""
+        async with self._get_client() as client:
+            resp = await client.get(f"/repos/{repo}/pulls/{pr_number}/files")
+            if resp.status_code == 200:
+                data = resp.json()
+                return data if isinstance(data, list) else []
+            return []
+
     async def find_existing_pr(self, repo: str, head_branch: str) -> Optional[Dict[str, Any]]:
         """Find an existing open PR by head branch, strictly verifying branch name match."""
         async with self._get_client() as client:

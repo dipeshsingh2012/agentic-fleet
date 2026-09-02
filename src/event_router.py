@@ -627,14 +627,37 @@ class EventRouter:
         # -------------------------------------------------------------
         # STAGE 4: Autonomous Development & PR Creation (dev-agent Phase 2)
         # -------------------------------------------------------------
-        if pr_number:
+        is_comment_trigger = bool(payload.get("comment") or payload.get("review"))
+
+        has_source_files = False
+        if not self.dry_run and pr_number and repo:
+            try:
+                pr_files = await self.github_client.get_pull_request_files(repo, pr_number)
+                has_source_files = any(
+                    not f.get("filename", "").startswith("docs/")
+                    for f in pr_files
+                )
+            except Exception as e:
+                print(f"[WARN] Failed checking PR files: {e}")
+        elif self.dry_run and pr_number:
+            has_source_files = True
+
+        comment_body_text = (
+            payload.get("comment", {}).get("body", "")
+            or payload.get("review", {}).get("body", "")
+        ).lower()
+        is_dev_requested = any(k in comment_body_text for k in ["@dev-agent", "@dev", "implement", "code", "materialize", "remediate", "action required"])
+
+        # If PR already open, already has source files, and not explicitly requesting dev implementation:
+        if pr_number and has_source_files and not (is_comment_trigger and is_dev_requested):
             print(f"[STAGE 4/6] ⏭️ dev-agent: Pull Request #{pr_number} on `{branch_name}` already open. Skipping initial creation.")
             pipeline_summary["stages"]["dev_agent"] = {"status": "skipped", "pr_number": pr_number, "branch_name": branch_name}
         else:
-            print("\n[STAGE 4/6] 🧑‍💻 Running dev-agent (Branching, Implementation & PR Opening)...")
+            action_desc = f"Updating / Materializing source files on `{branch_name}` for PR #{pr_number}" if pr_number else f"Branching `{branch_name}`, Implementation & PR Opening"
+            print(f"\n[STAGE 4/6] 🧑‍💻 Running dev-agent ({action_desc})...")
             dev_result = await self.handle_dev_agent(repo, payload)
             pipeline_summary["stages"]["dev_agent"] = dev_result
-            pr_number = dev_result.get("pr_number")
+            pr_number = dev_result.get("pr_number") or pr_number
             branch_name = dev_result.get("branch_name", branch_name)
 
         if not pr_number and not self.dry_run:
@@ -662,6 +685,10 @@ class EventRouter:
             "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
             "issue": {"number": effective_pr_number, "pull_request": {}},
         }
+
+        # If triggered by a human comment on PR requesting changes or code, re-audit the newly pushed code
+        if is_comment_trigger:
+            pr_labels = [l for l in pr_labels if l not in ["security:passed", "qa:passed", "status:approved", "ready-for-merge"]]
 
         # -------------------------------------------------------------
         # STAGE 5: Security & Multi-Tenant Audit (security-agent)
