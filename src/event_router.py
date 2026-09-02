@@ -450,7 +450,7 @@ class EventRouter:
             added_label = payload.get("label", {}).get("name", "")
             pr_labels = [lbl.get("name", "") for lbl in payload.get("pull_request", {}).get("labels", [])]
 
-            # Invalidate stale approvals on synchronize (new commits pushed)
+            # Invalidate stale approvals and run full pipeline on synchronize (new commits pushed)
             if action == "synchronize":
                 pr_num = self._extract_pr_number(payload)
                 if pr_num and not self.dry_run:
@@ -460,7 +460,7 @@ class EventRouter:
                             await self.github_client.remove_label(repo_name, pr_num, stale)
                         except Exception:
                             pass
-                return await self.handle_security_agent(repo_name, payload)
+                return await self.run_autonomous_pipeline(repo_name, payload)
 
             # Remediation trigger when defects or changes are requested on open PR
             if (
@@ -1285,11 +1285,20 @@ class EventRouter:
                     await self.github_client.create_issue_comment(repo, issue_number, issue_comment)
                 await self._safe_add_labels(repo, created_pr_number, ["ready-for-security-audit"])
             elif is_pr_remediation and created_pr_number:
-                # On PR remediation, comment on the PR with the updated files list
+                # On PR remediation, post a detailed summary of changes, pre-commit test status, and telemetry
+                file_list_md = "\n".join([f"- `{f}`" for f in extracted_files.keys()]) or "- Direct code patch (no new files created)"
+                telemetry_str = self.state_manager.get_telemetry_summary(repo, created_pr_number)
+                
                 pr_remed_comment = (
-                    f"## 🔄 `dev-agent` Remediation Update\n\n"
-                    f"Pushed **{len(extracted_files)} updated file(s)** to branch `{branch_name}` addressing review findings.\n\n"
-                    f"Handoff target: `@qa-agent` for re-verification."
+                    f"## 🔄 `dev-agent` Remediation Summary\n\n"
+                    f"### 📋 Materialized Changes\n"
+                    f"{file_list_md}\n\n"
+                    f"### 🧪 Pre-Commit Verification\n"
+                    f"- **Test Suite**: `{test_cmd}`\n"
+                    f"- **Result**: ✅ Verified in pre-commit sandbox ({actual_iterations} iteration(s))\n\n"
+                    f"### 📊 Telemetry\n"
+                    f"{telemetry_str}\n\n"
+                    f"👉 **Next Step**: Auto-triggering `security-agent` & `qa-agent` in-process verification."
                 )
                 await self.github_client.create_issue_comment(repo, created_pr_number, pr_remed_comment)
                 for stale in ["qa:failed", "status:changes-requested", "security:blocked"]:
