@@ -264,6 +264,12 @@ class EventRouter:
         )
         return body
 
+    def _get_workspace_dir(self) -> Path:
+        """Returns the active workspace directory, prioritizing test harness if set."""
+        if self.test_harness and getattr(self.test_harness, "cwd", None):
+            return Path(self.test_harness.cwd)
+        return Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+
     async def _ensure_branch_checkout(self, repo: str, branch_name: str) -> None:
         """Fetch and checkout target branch to ensure reviews and tests run against the branch code."""
         if not self.dry_run and branch_name and repo:
@@ -526,10 +532,47 @@ class EventRouter:
             "status": "in_progress",
         }
 
+        workspace_dir = self._get_workspace_dir()
+        has_existing_design = False
+        if (workspace_dir / "docs" / "design").exists():
+            has_existing_design = bool(list((workspace_dir / "docs" / "design").glob(f"DESIGN-{issue_number}*.md")))
+
+        is_pm_completed = bool(
+            pr_number
+            or any(
+                lbl in issue_labels
+                for lbl in [
+                    "agent:ready-for-design",
+                    "agent:design-review",
+                    "agent:design-approved",
+                    "agent:ready-for-dev",
+                    "ready-for-security-audit",
+                    "ready-for-qa",
+                    "ready-for-review",
+                    "status:changes-requested",
+                ]
+            )
+            or has_existing_design
+        )
+
+        is_design_approved = bool(
+            pr_number
+            or any(
+                lbl in issue_labels
+                for lbl in [
+                    "agent:design-approved",
+                    "agent:ready-for-dev",
+                    "ready-for-security-audit",
+                    "ready-for-qa",
+                    "ready-for-review",
+                ]
+            )
+        )
+
         # -------------------------------------------------------------
         # STAGE 1: Product Management & Specification (pm-agent)
         # -------------------------------------------------------------
-        if pr_number or "agent:ready-for-design" in issue_labels or "agent:ready-for-dev" in issue_labels or "ready-for-security-audit" in issue_labels:
+        if is_pm_completed:
             print("[STAGE 1/6] ⏭️ pm-agent: Specification already accepted. Skipping duplicate framing.")
             pipeline_summary["stages"]["pm_agent"] = {"status": "skipped", "reason": "already_completed"}
         else:
@@ -545,9 +588,9 @@ class EventRouter:
         # -------------------------------------------------------------
         # STAGE 2: Technical Design Document (dev-agent Phase 1)
         # -------------------------------------------------------------
-        if pr_number or "agent:design-approved" in issue_labels or "agent:ready-for-dev" in issue_labels:
-            print("[STAGE 2/6] ⏭️ dev-agent: Design document already approved. Skipping duplicate design phase.")
-            pipeline_summary["stages"]["dev_design"] = {"status": "skipped", "reason": "already_approved"}
+        if is_design_approved or (has_existing_design and "status:changes-requested" not in issue_labels):
+            print("[STAGE 2/6] ⏭️ dev-agent: Design document already exists and is active. Skipping duplicate design phase.")
+            pipeline_summary["stages"]["dev_design"] = {"status": "skipped", "reason": "already_authored"}
         else:
             print("\n[STAGE 2/6] 📐 Running dev-agent (Authoring docs/design/DESIGN-...)...")
             design_result = await self.handle_dev_design(repo, payload)
@@ -556,7 +599,7 @@ class EventRouter:
         # -------------------------------------------------------------
         # STAGE 3: Pre-Implementation Architect Review Gate (architect-agent Gate 1)
         # -------------------------------------------------------------
-        if pr_number or "agent:design-approved" in issue_labels or "agent:ready-for-dev" in issue_labels:
+        if is_design_approved:
             print("[STAGE 3/6] ⏭️ architect-agent: Design review already signed off. Skipping duplicate gate.")
             pipeline_summary["stages"]["architect_agent"] = {"status": "skipped", "verdict": "DESIGN_APPROVED"}
         else:
@@ -749,7 +792,7 @@ class EventRouter:
 
     async def handle_pm_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """pm-agent: clarifies vague tickets or formats full Living PRD spec and Gherkin criteria."""
-        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        workspace_dir = self._get_workspace_dir()
         ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
 
         issue = payload.get("issue", {})
@@ -819,7 +862,7 @@ class EventRouter:
 
     async def handle_dev_design(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """dev-agent (Phase 1): generates structured Technical Design Document in docs/design/DESIGN-<id>.md."""
-        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        workspace_dir = self._get_workspace_dir()
         ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
 
         issue = payload.get("issue", {})
@@ -875,7 +918,7 @@ class EventRouter:
 
     async def handle_architect_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """architect-agent (Gate 1): reviews docs/design/DESIGN-<id>.md before code implementation."""
-        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        workspace_dir = self._get_workspace_dir()
         ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
 
         issue = payload.get("issue", {})
@@ -931,7 +974,7 @@ class EventRouter:
 
     async def handle_dev_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """dev-agent: creates branch, generates code & unit tests, materializes files with full 360-degree context."""
-        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        workspace_dir = self._get_workspace_dir()
         ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
 
         pr_number = self._extract_pr_number(payload)
@@ -1111,7 +1154,7 @@ class EventRouter:
 
     async def handle_security_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """security-agent: scans diff for multi-tenant isolation, secrets, OWASP with full context awareness."""
-        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        workspace_dir = self._get_workspace_dir()
         ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
 
         pr_number = self._extract_pr_number(payload)
@@ -1183,7 +1226,7 @@ class EventRouter:
 
     async def handle_qa_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """qa-agent: guarantees execution on the PR's current branch with 360-degree context awareness."""
-        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        workspace_dir = self._get_workspace_dir()
         ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
 
         pr_number = self._extract_pr_number(payload)
@@ -1287,7 +1330,7 @@ class EventRouter:
 
     async def handle_senior_reviewer_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """senior-reviewer-agent: audits architecture/ADRs, checks Sec+QA, approves PR with full 360-degree context."""
-        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        workspace_dir = self._get_workspace_dir()
         ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
 
         pr_number = self._extract_pr_number(payload)
