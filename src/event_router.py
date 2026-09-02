@@ -344,6 +344,17 @@ class EventRouter:
 
         action = payload.get("action", "")
 
+        # Early Exit Guard: Ignore events on already closed or merged issues and pull requests
+        is_pr = bool(payload.get("pull_request") or payload.get("issue", {}).get("pull_request"))
+        target_state = (
+            payload.get("pull_request", {}).get("state")
+            or payload.get("issue", {}).get("state")
+        )
+        is_merged = payload.get("pull_request", {}).get("merged", False)
+        if target_state == "closed" or is_merged:
+            print(f"[EVENT ROUTER] ⏭️ Skipping event on already closed/merged {'PR' if is_pr else 'Issue'}.")
+            return {"status": "ignored", "reason": "Target PR or Issue is already closed or merged"}
+
         # 1. Issue Events
         if event_name == "issues":
             added_label = payload.get("label", {}).get("name", "")
@@ -352,12 +363,15 @@ class EventRouter:
             if "agent:autonomous" in labels or added_label == "agent:autonomous" or (action == "opened" and "agent:pm" not in labels and "agent:ready-for-dev" not in labels):
                 return await self.run_autonomous_pipeline(repo_name, payload)
 
-            if added_label in ["agent:ready-for-dev", "status:changes-requested", "qa:failed", "needs-remediation"] or "agent:ready-for-dev" in labels:
+            # Disambiguate pre-PR design changes vs implementation
+            if added_label in ["status:changes-requested", "agent:ready-for-design"] or "agent:ready-for-design" in labels:
+                print(f"[EVENT ROUTER] 📐 Issue #{payload.get('issue', {}).get('number')} design revision requested. Routing to dev-design...")
+                return await self.handle_dev_design(repo_name, payload)
+
+            if added_label in ["agent:ready-for-dev", "agent:design-approved", "agent:dev", "needs-remediation"] or "agent:ready-for-dev" in labels:
                 return await self.handle_dev_agent(repo_name, payload)
             if added_label == "agent:design-review" or "agent:design-review" in labels:
                 return await self.handle_architect_agent(repo_name, payload)
-            if added_label == "agent:ready-for-design" or "agent:ready-for-design" in labels:
-                return await self.handle_dev_design(repo_name, payload)
             if added_label == "agent:pm" or "agent:pm" in labels or action == "opened":
                 return await self.handle_pm_agent(repo_name, payload)
 
@@ -370,10 +384,22 @@ class EventRouter:
             if author.endswith("[bot]") or author in ["github-actions[bot]", "agentic-fleet"]:
                 return {"status": "ignored", "reason": f"Ignored comment from bot user '{author}'"}
 
-            comment_body = (
+            raw_body = (
                 payload.get("comment", {}).get("body", "")
                 or payload.get("review", {}).get("body", "")
-            ).lower()
+            )
+            comment_body = raw_body.lower()
+
+            # Extract inline diff context if this is an inline code review comment
+            diff_hunk = comment_obj.get("diff_hunk", "")
+            comment_path = comment_obj.get("path", "")
+            comment_line = comment_obj.get("line") or comment_obj.get("original_line")
+            if diff_hunk and comment_path:
+                comment_body = (
+                    f"inline review on `{comment_path}` (line {comment_line}):\n"
+                    f"{diff_hunk}\n"
+                    f"comment: {comment_body}"
+                )
 
             # 1. Pipeline trigger
             if "@fleet" in comment_body or "@autonomous" in comment_body or "run pipeline" in comment_body:
@@ -415,7 +441,19 @@ class EventRouter:
             added_label = payload.get("label", {}).get("name", "")
             pr_labels = [lbl.get("name", "") for lbl in payload.get("pull_request", {}).get("labels", [])]
 
-            # Remediation trigger when defects or changes are requested
+            # Invalidate stale approvals on synchronize (new commits pushed)
+            if action == "synchronize":
+                pr_num = self._extract_pr_number(payload)
+                if pr_num and not self.dry_run:
+                    stale_labels = ["ready-for-merge", "status:approved", "qa:passed", "security:passed", "qa:failed", "security:blocked", "status:changes-requested"]
+                    for stale in stale_labels:
+                        try:
+                            await self.github_client.remove_label(repo_name, pr_num, stale)
+                        except Exception:
+                            pass
+                return await self.handle_security_agent(repo_name, payload)
+
+            # Remediation trigger when defects or changes are requested on open PR
             if (
                 added_label in ["qa:failed", "status:changes-requested", "security:blocked", "needs-remediation", "agent:remediation", "ready-for-dev", "agent:ready-for-dev"]
                 or (action == "labeled" and added_label in ["qa:failed", "status:changes-requested", "security:blocked"])
@@ -427,7 +465,7 @@ class EventRouter:
                 return await self.handle_senior_reviewer_agent(repo_name, payload)
             if added_label == "ready-for-qa" or "ready-for-qa" in pr_labels:
                 return await self.handle_qa_agent(repo_name, payload)
-            if action in ["opened", "synchronize"] or added_label == "ready-for-security-audit" or "ready-for-security-audit" in pr_labels:
+            if action == "opened" or added_label == "ready-for-security-audit" or "ready-for-security-audit" in pr_labels:
                 return await self.handle_security_agent(repo_name, payload)
 
         # 4. Repository Dispatch Events (Autonomous MCP / Zero-Issue Fleet Dispatch)
@@ -1054,6 +1092,27 @@ class EventRouter:
             for f in design_dir.glob(f"DESIGN-{issue_number}*.md"):
                 design_content = f.read_text(encoding="utf-8")
                 break
+
+        # Check remote remediation loop count on PRs to prevent runaway webhook storms
+        if is_pr_remediation and not self.dry_run and pr_number and repo:
+            max_remote_remediations = int(os.getenv("MAX_REMOTE_REMEDIATIONS", "4"))
+            remed_count = review_history.count("dev-agent Remediation") + review_history.count("remediated_pr")
+            if remed_count >= max_remote_remediations:
+                print(f"[DEV-AGENT] 🛑 Remediation limit reached ({remed_count}/{max_remote_remediations}). Halting to prevent runaway CI.")
+                await self.github_client.add_labels(repo, pr_number, ["status:manual-intervention-required"])
+                await self.github_client.create_issue_comment(
+                    repo,
+                    pr_number,
+                    f"## 🛑 Autonomous Remediation Budget Exceeded\n\n"
+                    f"`dev-agent` has completed **{max_remote_remediations} automated remediation runs** on this PR without passing all QA/Security gates.\n\n"
+                    f"Execution has been paused with label `status:manual-intervention-required`. Please inspect the test logs and resolve any blocking defects.",
+                )
+                return {
+                    "agent": "dev-agent",
+                    "action": "halted_budget_exceeded",
+                    "pr_number": pr_number,
+                    "remediations": remed_count,
+                }
 
         if is_pr_remediation:
             feedback_text = comment_body.strip() or review_history.strip() or "Please fix all failing tests, collection errors, and defects flagged in the latest QA/Review audit."
