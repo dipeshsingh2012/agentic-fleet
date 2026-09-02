@@ -9,6 +9,7 @@ Features Multi-Model Tiering (Fast vs Deep) and automatic cross-provider failove
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -138,13 +139,20 @@ class LLMRunner:
 
     async def _generate_gemini(self, system_instruction: str, user_input: str, dry_run: bool = False, tier: str = "fast") -> str:
         """Generates response via Google GenAI SDK or REST API with model fallback."""
-        models = [
-            "gemini-2.0-flash",
-            "gemini-flash-latest",
-            "gemma-4-26b-a4b-it",
-            "gemini-2.5-flash",
-            "gemini-2.5-pro",
-        ]
+        if tier == "pro":
+            models = [
+                "gemini-1.5-pro",
+                "gemini-2.0-flash",
+                "gemini-2.0-flash-lite",
+                "gemini-1.5-flash",
+            ]
+        else:
+            models = [
+                "gemini-2.0-flash",
+                "gemini-2.0-flash-lite",
+                "gemini-1.5-flash",
+                "gemini-1.5-pro",
+            ]
 
         last_error = None
         for model_name in models:
@@ -166,6 +174,8 @@ class LLMRunner:
                         return resp.text
                 except Exception as e:
                     last_error = e
+                    if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                        await asyncio.sleep(2)
 
             # Try Gemini REST API
             if self.gemini_api_key:
@@ -185,6 +195,9 @@ class LLMRunner:
                                 text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                                 if text:
                                     print(f"[LLM:Gemini-REST] ✅ Generated response using model: {model_name}")
+                                    return text
+                        elif resp.status_code == 429:
+                            await asyncio.sleep(2)
                 except Exception as e:
                     last_error = e
 
