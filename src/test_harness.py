@@ -15,6 +15,7 @@ from typing import Dict, Optional
 @dataclass
 class TestResult:
     """Structured test suite execution outcome."""
+    __test__ = False
     command: str
     exit_code: int
     duration_seconds: float
