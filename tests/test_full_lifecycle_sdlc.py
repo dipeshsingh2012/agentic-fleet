@@ -16,7 +16,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from src.event_router import EventRouter
+from src.github_client import GitHubClient
 from src.test_harness import TestHarness, TestResult
+from tests.test_e2e_lifecycle_choreography import create_mock_github_client
 
 
 @pytest.mark.asyncio
@@ -243,3 +245,83 @@ async def test_architect_changes_requested_triggers_dev_design_revision(tmp_path
     # Verify updated design file created
     design_files = list((tmp_path / "docs" / "design").glob("DESIGN-10*.md"))
     assert len(design_files) == 1
+
+
+@pytest.mark.asyncio
+async def test_autonomous_pipeline_in_flight_design_self_healing(tmp_path: Path):
+    """
+    Validates that when architect-agent requests changes in run_autonomous_pipeline,
+    the pipeline does not deadlock or halt; it automatically performs in-flight
+    design revision with dev-agent and re-audits with architect-agent, proceeding
+    to implementation once approved.
+    """
+    harness = MagicMock(spec=TestHarness)
+    harness.cwd = str(tmp_path)
+    harness.run_command = AsyncMock(return_value=TestResult(command="", exit_code=0, duration_seconds=0.1, stdout="ok", stderr=""))
+    (tmp_path / "backend" / "tests").mkdir(parents=True, exist_ok=True)
+
+    import os
+    os.environ["TARGET_WORKSPACE"] = str(tmp_path)
+
+    router = EventRouter(dry_run=False, test_harness=harness)
+    mock_client = create_mock_github_client()
+    router.github_client = mock_client
+
+    responses = [
+        # 1. dev_design initial draft
+        "## Technical Design: OAuth SSO\nDraft without HMAC state.",
+        # 2. architect audit 1 -> CHANGES_REQUESTED
+        "STATUS: CHANGES_REQUESTED 🛑 Revisions required: Add HMAC signature on state token.",
+        # 3. dev_design revision 1 -> updated design doc
+        "## Technical Design: OAuth SSO (Revised)\nUpdated with HMAC-signed state token and tenant context.",
+        # 4. architect audit 2 -> DESIGN_APPROVED
+        "STATUS: DESIGN_APPROVED (LGTM ✅) All ADRs and state token security invariants satisfied.",
+        # 5. dev_agent code implementation
+        "def google_sso(): pass",
+        # 6. dev_agent tests
+        "def test_sso(): pass",
+        # 7. security audit
+        "STATUS: PASSED ✅ Multi-tenant isolation verified.",
+        # 8. qa audit
+        "STATUS: PASSED ✅ 100% test pass rate.",
+        # 9. senior reviewer
+        "STATUS: APPROVED LGTM ✅ Ready for merge.",
+    ]
+    response_iter = iter(responses)
+
+    async def mock_generate_response(*args, **kwargs):
+        try:
+            return next(response_iter)
+        except StopIteration:
+            return "STATUS: PASSED ✅"
+
+    router.llm_runner.generate_response = AsyncMock(side_effect=mock_generate_response)
+
+    payload = {
+        "action": "opened",
+        "repository": {"full_name": "dipeshsingh2012/rfpengine"},
+        "issue": {
+            "number": 13,
+            "title": "Implement Google SSO",
+            "body": "User authentication via Google OAuth2 with tenant isolation.",
+            "labels": [{"name": "agent:ready-for-design"}],
+        },
+    }
+
+    result = await router.run_autonomous_pipeline("dipeshsingh2012/rfpengine", payload)
+
+    assert result["pipeline"] == "autonomous-5-agent-sdlc"
+    assert result["status"] == "completed_awaiting_human_merge"
+
+    stages = result["stages"]
+    assert "dev_design" in stages
+    assert "architect_agent" in stages
+    assert "dev_agent" in stages
+    assert stages["architect_agent"]["verdict"] == "DESIGN_APPROVED"
+
+    # Verify that status:changes-requested removal was attempted and design approved was tagged
+    mock_client.remove_label.assert_any_call("dipeshsingh2012/rfpengine", 13, "status:changes-requested")
+    mock_client.add_labels.assert_any_call(
+        "dipeshsingh2012/rfpengine", 13, ["agent:design-approved", "agent:ready-for-dev"]
+    )
+

@@ -666,10 +666,24 @@ class EventRouter:
                 pipeline_summary["status"] = "awaiting_clarification"
                 return pipeline_summary
 
+        # Check if historical architect review comments exist when revisions are requested
+        if not payload.get("architect_feedback") and ("status:changes-requested" in issue_labels or "agent:design-review" in issue_labels):
+            if not self.dry_run and repo and isinstance(issue_number, int):
+                try:
+                    existing_comments = await self.github_client.get_issue_comments(repo, issue_number)
+                    for c in reversed(existing_comments):
+                        body = c.get("body", "")
+                        if "Architect" in body and ("CHANGES_REQUESTED" in body or "Required Revisions" in body):
+                            payload["architect_feedback"] = body
+                            print(f"[EVENT ROUTER] 💡 Extracted historical architect feedback from issue #{issue_number} comments.")
+                            break
+                except Exception as e:
+                    print(f"[WARN] Failed fetching historical architect feedback comments: {e}")
+
         # -------------------------------------------------------------
-        # STAGE 2: Technical Design Document (dev-agent Phase 1)
+        # STAGES 2 & 3: Technical Design & Architect Review Gate Loop
         # -------------------------------------------------------------
-        if is_design_approved or (has_existing_design and "status:changes-requested" not in issue_labels):
+        if is_design_approved or (has_existing_design and "status:changes-requested" not in issue_labels and not payload.get("architect_feedback")):
             print("[STAGE 2/6] ⏭️ dev-agent: Design document already exists and is active. Skipping duplicate design phase.")
             pipeline_summary["stages"]["dev_design"] = {"status": "skipped", "reason": "already_authored"}
         else:
@@ -688,10 +702,30 @@ class EventRouter:
             arch_result = await self.handle_architect_agent(repo, payload)
             pipeline_summary["stages"]["architect_agent"] = arch_result
 
+            # In-Flight Design Self-Healing Loop:
+            # If changes are requested, allow dev-agent to iteratively revise the design in-flight
+            max_design_revisions = int(os.getenv("MAX_DESIGN_REVISIONS", "2"))
+            design_rev_count = 0
+
+            while arch_result.get("verdict") == "CHANGES_REQUESTED" and design_rev_count < max_design_revisions:
+                design_rev_count += 1
+                print(f"\n[STAGE 2/6 - REVISION {design_rev_count}/{max_design_revisions}] 📐 architect-agent requested revisions. dev-agent revising design document...")
+                payload["architect_feedback"] = arch_result.get("response", "")
+
+                design_result = await self.handle_dev_design(repo, payload)
+                pipeline_summary["stages"]["dev_design"] = design_result
+
+                print(f"\n[STAGE 3/6 - RE-AUDIT {design_rev_count}/{max_design_revisions}] 🏛️ architect-agent re-auditing revised design...")
+                arch_result = await self.handle_architect_agent(repo, payload)
+                pipeline_summary["stages"]["architect_agent"] = arch_result
+
             if arch_result.get("verdict") == "CHANGES_REQUESTED":
-                print("\n[HALT] 🛑 architect-agent design changes requested. Halting pipeline to allow discrete dev-design revision.")
+                print(f"\n[HALT] 🛑 architect-agent design changes could not be resolved after {design_rev_count} in-flight revision(s). Halting pipeline.")
                 pipeline_summary["status"] = "design_changes_requested"
                 return pipeline_summary
+            else:
+                is_design_approved = True
+                print("\n[STAGE 3/6] ✅ Design approved by architect-agent. Proceeding seamlessly to Stage 4 (dev-agent implementation).")
 
         # -------------------------------------------------------------
         # STAGE 4: Autonomous Development & PR Creation (dev-agent Phase 2)
@@ -931,6 +965,18 @@ class EventRouter:
             issue_info={"number": issue_number, "title": issue_title, "body": issue_body},
         )
         architect_feedback = payload.get("architect_feedback") or ""
+        if not architect_feedback and not self.dry_run and repo and isinstance(issue_number, int):
+            try:
+                existing_comments = await self.github_client.get_issue_comments(repo, issue_number)
+                for c in reversed(existing_comments):
+                    body = c.get("body", "")
+                    if "Architect" in body and ("CHANGES_REQUESTED" in body or "Required Revisions" in body):
+                        architect_feedback = body
+                        print(f"[DEV-AGENT] 💡 Extracted historical architect feedback from issue #{issue_number} comments.")
+                        break
+            except Exception as e:
+                print(f"[WARN] Failed fetching issue comments for architect feedback: {e}")
+
         if architect_feedback:
             user_input = (
                 f"{context_block}\n\n"
@@ -1006,7 +1052,14 @@ class EventRouter:
         if not self.dry_run and isinstance(issue_number, int) and repo:
             await self.github_client.create_issue_comment(repo, issue_number, response)
             if is_approved:
-                await self.github_client.remove_label(repo, issue_number, "agent:design-review")
+                try:
+                    await self.github_client.remove_label(repo, issue_number, "status:changes-requested")
+                except Exception:
+                    pass
+                try:
+                    await self.github_client.remove_label(repo, issue_number, "agent:design-review")
+                except Exception:
+                    pass
                 await self.github_client.add_labels(repo, issue_number, ["agent:design-approved", "agent:ready-for-dev"])
             else:
                 await self.github_client.add_labels(repo, issue_number, ["status:changes-requested"])
