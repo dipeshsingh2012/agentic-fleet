@@ -161,8 +161,11 @@ class EventRouter:
         files: Dict[str, str] = {}
         has_backend_dir = (workspace_dir / "backend").exists() and (workspace_dir / "backend").is_dir()
 
-        # Pattern 1: ```lang:path/to/file.ext\ncode\n```
-        p1 = re.compile(r"```[a-zA-Z0-9_\-\.]*:([a-zA-Z0-9_\-\.\/]+)\n(.*?)```", re.DOTALL)
+        # Pattern 1: ```lang:path/to/file.ext or ```lang title="path/to/file.ext"
+        p1 = re.compile(
+            r"```[a-zA-Z0-9_\-\.]*(?::|\s+title=[\"']|\s+file=[\"']|\s+filepath=[\"'])([a-zA-Z0-9_\-\.\/]+)[\"']?\n(.*?)```",
+            re.DOTALL,
+        )
         for match in p1.finditer(content):
             path_str = match.group(1).strip()
             code = match.group(2)
@@ -171,7 +174,7 @@ class EventRouter:
 
         # Pattern 2: Header/Comment path followed immediately by ```lang\ncode\n```
         p2 = re.compile(
-            r"(?:###?\s*(?:File:\s*)?`?([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+)`?|#\s*filepath:\s*([a-zA-Z0-9_\-\.\/]+)|#\s*([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+))\s*\n\s*```[a-zA-Z0-9_\-\.]*\n(.*?)```",
+            r"(?:###?\s*(?:File:\s*|File Path:\s*)?`?([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+)`?|#\s*filepath:\s*([a-zA-Z0-9_\-\.\/]+)|#\s*([a-zA-Z0-9_\-\.\/]+\.[a-zA-Z0-9]+))\s*\n\s*```[a-zA-Z0-9_\-\.]*\n(.*?)```",
             re.DOTALL,
         )
         for match in p2.finditer(content):
@@ -1017,18 +1020,31 @@ class EventRouter:
             review_history=review_history,
         )
 
+        # Fetch existing approved design document if available
+        design_content = ""
+        design_dir = workspace_dir / "docs" / "design"
+        if design_dir.exists():
+            for f in design_dir.glob(f"DESIGN-{issue_number}*.md"):
+                design_content = f.read_text(encoding="utf-8")
+                break
+
         if is_pr_remediation:
             user_input = (
                 f"{context_block}\n\n"
                 f"### ⚠️ Remediation Task for Pull Request #{pr_number}\n"
                 f"Latest Reviewer / QA Feedback:\n{comment_body}\n\n"
-                f"Implement all required remediations adhering strictly to the directory layout, fix any test issues, and output all code blocks using ```python:backend/path/to/file.py."
+                f"You are in **PHASE 2: CODE IMPLEMENTATION**. Implement all required remediations adhering strictly to the directory layout, fix any test issues, and output all code blocks using ```python:backend/path/to/file.py or ```yaml:.github/workflows/file.yml."
             )
         else:
+            design_section = f"\n\n### 📐 Approved Technical Design Document:\n{design_content}\n" if design_content else ""
             user_input = (
-                f"{context_block}\n\n"
-                f"Implement specification for Issue #{issue_number}: {issue_title}\n\n"
-                f"Output all implementation and test files using ```python:backend/path/to/file.py blocks."
+                f"{context_block}{design_section}\n\n"
+                f"## 🚨 PHASE 2: CODE IMPLEMENTATION CONTRACT\n"
+                f"The Technical Design Document for Issue #{issue_number}: '{issue_title}' has been APPROVED by the Principal Architect.\n\n"
+                f"### YOUR MANDATORY ACTION:\n"
+                f"1. You MUST materialize and implement all actual source code files and unit/integration test files required for this feature.\n"
+                f"2. DO NOT output a design document, markdown proposal, or conversational chatter.\n"
+                f"3. Output complete, working code in explicit file blocks: ```python:backend/path/to/file.py or ```yaml:.github/workflows/file.yml."
             )
 
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="fast")
