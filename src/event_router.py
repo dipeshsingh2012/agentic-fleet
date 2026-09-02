@@ -1081,6 +1081,27 @@ class EventRouter:
             # 2. Materialize code and test files into the actual codebase!
             extracted_files = self._materialize_code_files(workspace_dir, response)
             initial_response = response
+
+            # If 0 code files were materialized, force an immediate re-prompt to generate code blocks
+            retry_count = 0
+            while len(extracted_files) == 0 and retry_count < 2:
+                retry_count += 1
+                print(f"[DEV-AGENT] ⚠️ No code blocks detected in response. Retrying file extraction (Attempt {retry_count}/2)...")
+                code_retry_input = (
+                    f"CRITICAL ERROR: Your response contained NO code blocks with filenames.\n\n"
+                    f"You are strictly in **PHASE 2: CODE IMPLEMENTATION**.\n"
+                    f"You MUST generate the actual source code and test files now.\n"
+                    f"Format each file strictly with its relative path in the code block header:\n"
+                    f"```python:path/to/file.py\n# Code here\n```\n"
+                    f"or\n```yaml:.github/workflows/ci.yml\n# YAML here\n```"
+                )
+                retry_response = await self.llm_runner.generate_response(prompt, code_retry_input, dry_run=self.dry_run, tier="fast")
+                extracted_files = self._materialize_code_files(workspace_dir, retry_response)
+                if extracted_files:
+                    response = retry_response
+                    initial_response = retry_response
+                    break
+
             print(f"[DEV-AGENT] 🚀 Materialized {len(extracted_files)} files: {list(extracted_files.keys())}")
 
             # 3. Pre-Commit Self-Healing Sandbox Loop: verify locally before pushing!
