@@ -21,10 +21,10 @@ from src.test_harness import TestHarness, TestResult
 
 
 @pytest.mark.asyncio
-async def test_dev_agent_remediation_loop_strictly_capped_at_3_iterations(tmp_path: Path):
+async def test_dev_agent_remediation_loop_strictly_capped_at_5_iterations(tmp_path: Path):
     """
     Ensures that if tests continuously fail, the dev agent's pre-commit auto-remediation loop
-    strictly terminates after at most 3 iterations and does NOT loop indefinitely.
+    strictly terminates after at most 5 iterations and does NOT loop indefinitely.
     """
     mock_harness = MagicMock(spec=TestHarness)
     mock_harness.cwd = str(tmp_path)
@@ -80,10 +80,48 @@ async def test_dev_agent_remediation_loop_strictly_capped_at_3_iterations(tmp_pa
 
     result = await router.handle_dev_agent("dipeshsingh2012/rfpengine", payload)
 
-    # STRICT ASSERTION: Exactly 3 test iterations were executed, no more, no less
-    assert call_counts["tests"] == 3, f"Expected exactly 3 test iterations, but got {call_counts['tests']}"
+    # STRICT ASSERTION: Exactly 5 test iterations were executed, no more, no less
+    assert call_counts["tests"] == 5, f"Expected exactly 5 test iterations, but got {call_counts['tests']}"
     assert result["agent"] == "dev-agent"
     assert result["action"] == "toggled_development"
+
+
+@pytest.mark.asyncio
+async def test_dev_agent_remediation_env_override(tmp_path: Path, monkeypatch):
+    """
+    Ensures that MAX_REMEDIATION_ITERATIONS environment variable can configure the budget.
+    """
+    monkeypatch.setenv("MAX_REMEDIATION_ITERATIONS", "2")
+    mock_harness = MagicMock(spec=TestHarness)
+    mock_harness.cwd = str(tmp_path)
+
+    call_counts = {"tests": 0}
+
+    async def mock_run_command(cmd: str, timeout: float = 300.0) -> TestResult:
+        if "pytest" in cmd:
+            call_counts["tests"] += 1
+            return TestResult(command=cmd, exit_code=1, duration_seconds=0.1, stdout="fail", stderr="", failed_tests=1)
+        return TestResult(command=cmd, exit_code=0, duration_seconds=0.1, stdout="ok", stderr="")
+
+    mock_harness.run_command = AsyncMock(side_effect=mock_run_command)
+
+    router = EventRouter(dry_run=False, test_harness=mock_harness)
+    router.github_client = MagicMock()
+    router.github_client.token = "mock-token"
+    router.github_client.create_issue_comment = AsyncMock(return_value={"id": 101})
+    router.github_client.create_pull_request = AsyncMock(return_value={"number": 42})
+    router.github_client.add_issue_labels = AsyncMock(return_value={})
+
+    (tmp_path / "backend").mkdir(parents=True)
+
+    payload = {
+        "action": "labeled",
+        "repository": {"full_name": "dipeshsingh2012/rfpengine"},
+        "issue": {"number": 99, "title": "Test", "body": "test", "labels": [{"name": "agent:ready-for-dev"}]},
+    }
+
+    await router.handle_dev_agent("dipeshsingh2012/rfpengine", payload)
+    assert call_counts["tests"] == 2
 
 
 @pytest.mark.asyncio

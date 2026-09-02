@@ -739,8 +739,9 @@ class EventRouter:
 
             # 3. Pre-Commit Self-Healing Sandbox Loop: verify locally before pushing!
             test_cmd = "pytest -v backend/tests" if ws_info.get("has_backend") else "pytest -v"
-            for iteration in range(1, 4):
-                print(f"[DEV-AGENT] 🧪 Running pre-commit test verification (Iteration {iteration}/3)...")
+            max_remediations = int(os.getenv("MAX_REMEDIATION_ITERATIONS", "5"))
+            for iteration in range(1, max_remediations + 1):
+                print(f"[DEV-AGENT] 🧪 Running pre-commit test verification (Iteration {iteration}/{max_remediations})...")
                 test_res = await self.test_harness.run_command(test_cmd)
                 if test_res.is_success or test_res.failed_tests == 0:
                     print(f"[DEV-AGENT] ✅ Pre-commit test suite PASSED ({test_res.passed_tests} passed, 0 failures)!")
