@@ -416,21 +416,21 @@ class EventRouter:
                 print("[EVENT ROUTER] 🧑‍💻 Review reported defects / changes requested. Routing directly to dev-agent for remediation...")
                 return await self.handle_dev_agent(repo_name, payload)
 
-            # 3. Explicit agent mentions
-            if "@architect-agent" in comment_body or "@architect" in comment_body:
-                return await self.handle_architect_agent(repo_name, payload)
-            if "@dev-design" in comment_body or "@design" in comment_body:
-                return await self.handle_dev_design(repo_name, payload)
-            if "@dev-agent" in comment_body or "@dev" in comment_body:
-                return await self.handle_dev_agent(repo_name, payload)
-            if "@pm-agent" in comment_body or "@pm" in comment_body:
-                return await self.handle_pm_agent(repo_name, payload)
-            if "@security-agent" in comment_body:
-                return await self.handle_security_agent(repo_name, payload)
-            if "@qa-agent" in comment_body:
+            # 3. Explicit agent mentions (using word boundaries to prevent false substring matches)
+            if re.search(r"@qa(-agent)?\b", comment_body):
                 return await self.handle_qa_agent(repo_name, payload)
-            if "@senior-reviewer-agent" in comment_body or "@reviewer" in comment_body:
+            if re.search(r"@security(-agent)?\b", comment_body):
+                return await self.handle_security_agent(repo_name, payload)
+            if re.search(r"@(senior-reviewer-agent|reviewer|senior-reviewer)\b", comment_body):
                 return await self.handle_senior_reviewer_agent(repo_name, payload)
+            if re.search(r"@architect(-agent)?\b", comment_body):
+                return await self.handle_architect_agent(repo_name, payload)
+            if re.search(r"@(dev-design|design)\b", comment_body):
+                return await self.handle_dev_design(repo_name, payload)
+            if re.search(r"@dev(-agent)?\b", comment_body):
+                return await self.handle_dev_agent(repo_name, payload)
+            if re.search(r"@pm(-agent)?\b", comment_body):
+                return await self.handle_pm_agent(repo_name, payload)
 
             # 4. Default for all human comments: engage smart autonomous fleet!
             print(f"[EVENT ROUTER] 🛸 Human comment by @{author or 'user'} received. Engaging autonomous fleet orchestrator...")
