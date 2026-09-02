@@ -5,7 +5,6 @@ Features 360-degree context awareness, dynamic file materialization, inter-agent
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 import os
@@ -381,8 +380,10 @@ class EventRouter:
             comment_obj = payload.get("comment", {}) or payload.get("review", {})
             author = comment_obj.get("user", {}).get("login", "")
             
-            # Avoid self-triggering infinite loops on bot comments
-            if author.endswith("[bot]") or author in ["github-actions[bot]", "agentic-fleet"]:
+            # Avoid self-triggering infinite loops on bot comments, but allow formal bot reviews requesting changes
+            is_bot = author.endswith("[bot]") or author in ["github-actions[bot]", "agentic-fleet"]
+            review_state = (payload.get("review", {}).get("state") or "").lower()
+            if is_bot and review_state != "changes_requested":
                 return {"status": "ignored", "reason": f"Ignored comment from bot user '{author}'"}
 
             raw_body = (
@@ -1529,13 +1530,28 @@ class EventRouter:
         )
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="deep")
 
+        is_approved = "DECISION: APPROVED" in response or "STATUS: APPROVED" in response or "LGTM" in response or "STATUS: PASSED" in response or self.dry_run
+        is_changes_requested = (
+            "CHANGES_REQUESTED" in response
+            or "CHANGES REQUESTED" in response
+            or "DECISION: REJECTED" in response
+            or "ACTION REQUIRED" in response
+        ) and not is_approved
+
         if not self.dry_run and pr_number and repo:
-            await self.github_client.create_pr_review(repo, pr_number, response, event="APPROVE")
-            await self.github_client.add_labels(repo, pr_number, ["status:approved", "ready-for-merge"])
+            if is_changes_requested:
+                await self.github_client.create_pr_review(repo, pr_number, response, event="REQUEST_CHANGES")
+                await self._safe_remove_label(repo, pr_number, "ready-for-merge")
+                await self._safe_remove_label(repo, pr_number, "status:approved")
+                await self._safe_add_labels(repo, pr_number, ["status:changes-requested"])
+            else:
+                await self.github_client.create_pr_review(repo, pr_number, response, event="APPROVE")
+                await self._safe_remove_label(repo, pr_number, "status:changes-requested")
+                await self._safe_add_labels(repo, pr_number, ["status:approved", "ready-for-merge"])
 
         return {
             "agent": "senior-reviewer-agent",
-            "action": "architect_review_approval",
+            "action": "architect_review_approval" if is_approved else "architect_review_changes_requested",
             "pr_number": effective_pr_number,
             "response": response,
         }
