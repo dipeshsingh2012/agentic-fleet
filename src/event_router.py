@@ -16,7 +16,10 @@ from typing import Any, Dict, List, Optional
 
 from src.github_client import GitHubClient
 from src.llm_runner import LLMRunner
+from src.state_manager import StateManager
+from src.symbol_indexer import SymbolIndexer
 from src.test_harness import TestHarness
+from src.workspace_inspector import WorkspaceInspector, WorkspaceProfile
 
 logger = logging.getLogger("agentic-fleet.event_router")
 
@@ -137,6 +140,7 @@ class EventRouter:
         self.github_client = github_client or GitHubClient()
         self.llm_runner = llm_runner or LLMRunner()
         self.test_harness = test_harness or TestHarness()
+        self.state_manager = StateManager()
         self.dry_run = dry_run
 
     def load_event_payload(self, event_path: Optional[str] = None) -> Dict[str, Any]:
@@ -158,9 +162,10 @@ class EventRouter:
         return None
 
     def _materialize_code_files(self, workspace_dir: Path, content: str) -> Dict[str, str]:
-        """Extract and write all source and test code blocks into real repository files with __init__.py support."""
+        """Extract and write all source and test code blocks into real repository files with language-aware package markers."""
         files: Dict[str, str] = {}
-        has_backend_dir = (workspace_dir / "backend").exists() and (workspace_dir / "backend").is_dir()
+        profile = WorkspaceInspector.inspect(workspace_dir)
+        has_backend_dir = profile.has_backend_dir
 
         # Pattern 1: ```lang:path/to/file.ext or ```lang title="path/to/file.ext"
         p1 = re.compile(
@@ -199,14 +204,15 @@ class EventRouter:
             materialized[target_rel] = file_code
             print(f"[DEV-AGENT] 📝 Materialized file ({len(file_code)} chars): {target_rel}")
 
-            # Ensure all parent Python directories contain __init__.py
-            curr_dir = target_path.parent
-            while curr_dir != workspace_dir and curr_dir.is_relative_to(workspace_dir):
-                init_file = curr_dir / "__init__.py"
-                if not init_file.exists() and (curr_dir.name not in ["tests", "docs"]):
-                    init_file.write_text("# Package marker\n", encoding="utf-8")
-                    print(f"[DEV-AGENT] 📦 Created package marker: {init_file.relative_to(workspace_dir)}")
-                curr_dir = curr_dir.parent
+            # Ensure parent Python directories contain __init__.py only for Python projects
+            if profile.package_markers_needed and target_rel.endswith(".py"):
+                curr_dir = target_path.parent
+                while curr_dir != workspace_dir and curr_dir.is_relative_to(workspace_dir):
+                    init_file = curr_dir / "__init__.py"
+                    if not init_file.exists() and (curr_dir.name not in ["tests", "docs"]):
+                        init_file.write_text("# Package marker\n", encoding="utf-8")
+                        print(f"[DEV-AGENT] 📦 Created package marker: {init_file.relative_to(workspace_dir)}")
+                    curr_dir = curr_dir.parent
 
         # Clean up misplaced root-level folders if backend/ exists
         if has_backend_dir:
@@ -1012,6 +1018,7 @@ class EventRouter:
         """dev-agent: creates branch, generates code & unit tests, materializes files with full 360-degree context."""
         workspace_dir = self._get_workspace_dir()
         ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
+        profile = WorkspaceInspector.inspect(workspace_dir)
 
         pr_number = self._extract_pr_number(payload)
         issue = payload.get("issue", {})
@@ -1046,12 +1053,17 @@ class EventRouter:
             {"issue_number": effective_num, "issue_title": issue_title, "issue_body": issue_body, "branch_name": branch_name},
         )
 
+        symbols = SymbolIndexer.extract_symbols(workspace_dir)
+        symbol_outline = SymbolIndexer.format_symbol_outline(symbols)
+
         context_block = AgentContextBuilder.format_context_block(
             workspace_info=ws_info,
             issue_info={"number": effective_num, "title": issue_title, "body": issue_body},
             pr_info={"number": effective_num, "branch": branch_name, "diff": diff_content} if is_pr_remediation else None,
             review_history=review_history,
         )
+        if symbol_outline:
+            context_block = f"{context_block}\n\n{symbol_outline}"
 
         # Fetch existing approved design document if available
         design_content = ""
@@ -1070,7 +1082,7 @@ class EventRouter:
                 + history_lower.count("remediation update")
                 + history_lower.count("remediated_pr")
             )
-            if remed_count >= max_remote_remediations:
+            if remed_count >= max_remote_remediations or self.state_manager.is_budget_exceeded(repo, pr_number, max_remote_remediations):
                 print(f"[DEV-AGENT] 🛑 Remediation limit reached ({remed_count}/{max_remote_remediations}). Halting to prevent runaway CI.")
                 await self._safe_add_labels(repo, pr_number, ["status:manual-intervention-required"])
                 await self.github_client.create_issue_comment(
@@ -1095,8 +1107,8 @@ class EventRouter:
                 f"Latest Reviewer / QA Feedback:\n{feedback_text}\n\n"
                 f"You are in **PHASE 2: CODE IMPLEMENTATION**.\n"
                 f"1. Implement all required remediations adhering strictly to the directory layout.\n"
-                f"2. If you introduce or rely on third-party libraries (e.g. `PyJWT`, `email-validator` for `EmailStr`, `google-auth`, etc.), you MUST update `backend/requirements.txt` or repository dependency manifest.\n"
-                f"3. Output all code blocks using explicit paths: ```python:backend/path/to/file.py or ```text:backend/requirements.txt or ```yaml:.github/workflows/file.yml."
+                f"2. If you introduce or rely on third-party libraries, you MUST update the dependency manifest (`requirements.txt`, `package.json`, etc.).\n"
+                f"3. Output all code blocks using explicit paths: ```python:path/to/file.py or ```text:requirements.txt or ```yaml:file.yml."
             )
         else:
             design_section = f"\n\n### 📐 Approved Technical Design Document:\n{design_content}\n" if design_content else ""
@@ -1106,9 +1118,9 @@ class EventRouter:
                 f"The Technical Design Document for Issue #{issue_number}: '{issue_title}' has been APPROVED by the Principal Architect.\n\n"
                 f"### YOUR MANDATORY ACTION:\n"
                 f"1. You MUST materialize and implement all actual source code files and unit/integration test files required for this feature.\n"
-                f"2. If your implementation introduces new third-party imports (e.g. `PyJWT`, `email-validator`, `google-auth`), you MUST update `backend/requirements.txt` (or dependency manifest) in your output.\n"
+                f"2. If your implementation introduces new third-party imports, you MUST update the dependency manifest in your output.\n"
                 f"3. DO NOT output a design document, markdown proposal, or conversational chatter.\n"
-                f"4. Output complete, working code in explicit file blocks: ```python:backend/path/to/file.py or ```text:backend/requirements.txt or ```yaml:.github/workflows/file.yml."
+                f"4. Output complete, working code in explicit file blocks: ```python:path/to/file.py or ```text:requirements.txt or ```yaml:file.yml."
             )
 
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="fast")
@@ -1138,7 +1150,7 @@ class EventRouter:
                     f"You MUST generate the actual source code and test files now.\n"
                     f"Format each file strictly with its relative path in the code block header:\n"
                     f"```python:path/to/file.py\n# Code here\n```\n"
-                    f"or\n```text:backend/requirements.txt\n# requirements here\n```"
+                    f"or\n```text:requirements.txt\n# requirements here\n```"
                 )
                 retry_response = await self.llm_runner.generate_response(prompt, code_retry_input, dry_run=self.dry_run, tier="fast")
                 extracted_files = self._materialize_code_files(workspace_dir, retry_response)
@@ -1159,12 +1171,12 @@ class EventRouter:
                     await self.test_harness.run_command("npm install")
 
             # 3. Pre-Commit Self-Healing Sandbox Loop: verify locally before pushing!
-            test_cmd = "pytest -v backend/tests" if ws_info.get("has_backend") else "pytest -v"
+            test_cmd = profile.test_command
             max_remediations = int(os.getenv("MAX_REMEDIATION_ITERATIONS", "5"))
             actual_iterations = 1
             for iteration in range(1, max_remediations + 1):
                 actual_iterations = iteration
-                print(f"[DEV-AGENT] 🧪 Running pre-commit test verification (Iteration {iteration}/{max_remediations})...")
+                print(f"[DEV-AGENT] 🧪 Running pre-commit test verification (Iteration {iteration}/{max_remediations}) using `{test_cmd}`...")
                 test_res = await self.test_harness.run_command(test_cmd)
                 if test_res.is_success or test_res.failed_tests == 0:
                     print(f"[DEV-AGENT] ✅ Pre-commit test suite PASSED ({test_res.passed_tests} passed, 0 failures)!")
@@ -1175,7 +1187,7 @@ class EventRouter:
                     is_missing_dep = "ModuleNotFoundError" in test_res.failure_summary or "ImportError" in test_res.failure_summary
                     dep_guidance = (
                         "\n\n🚨 DEPENDENCY ERROR DETECTED: Missing third-party modules or uninstalled packages were detected during test collection.\n"
-                        "You MUST update `backend/requirements.txt` (or repository manifest) to declare the missing library (e.g. `PyJWT`, `email-validator`, etc.) AND ensure all imports in your code are correct.\n"
+                        "You MUST update the dependency manifest to declare the missing library AND ensure all imports in your code are correct.\n"
                         if is_missing_dep else ""
                     )
 
@@ -1184,8 +1196,8 @@ class EventRouter:
                         f"### Test Command: {test_cmd}\n"
                         f"### Error Traceback:\n```\n{test_res.failure_summary}\n```\n"
                         f"{dep_guidance}\n"
-                        f"Please fix all missing imports (e.g. from typing import AsyncGenerator, etc.), missing functions, missing dependencies, and test errors.\n"
-                        f"Output all corrected files in ```python:backend/path/to/file.py or ```text:backend/requirements.txt blocks."
+                        f"Please fix all missing imports, missing functions, missing dependencies, and test errors.\n"
+                        f"Output all corrected files in code blocks with path headers."
                     )
                     fix_response = await self.llm_runner.generate_response(prompt, fix_input, dry_run=self.dry_run, tier="fast")
                     re_extracted = self._materialize_code_files(workspace_dir, fix_response)
@@ -1216,12 +1228,30 @@ class EventRouter:
                 if not res.is_success and res.exit_code != 0:
                     print(f"[ERROR] Git command failed: {cmd}\nStdout: {res.stdout}\nStderr: {res.stderr}")
 
+            # Optimistic git push with rebase-retry on conflict
             push_cmd = f"git push origin {branch_name} --force"
             if token:
                 push_cmd = f"git push https://x-access-token:{token}@github.com/{repo}.git {branch_name} --force"
 
-            push_res = await self.test_harness.run_command(push_cmd)
-            if not push_res.is_success and push_res.exit_code != 0:
+            push_success = False
+            for push_attempt in range(1, 4):
+                push_res = await self.test_harness.run_command(push_cmd)
+                if push_res.is_success or "Everything up-to-date" in push_res.stdout:
+                    push_success = True
+                    break
+                print(f"[SDLC] ⚠️ Git push attempt {push_attempt}/3 failed. Re-syncing branch with fetch...")
+                await self.test_harness.run_command(f"git fetch origin {branch_name}")
+
+            # Record telemetry in state manager
+            self.state_manager.record_run(
+                repo=repo,
+                pr_number=effective_num,
+                agent="dev-agent",
+                action="remediated_pr" if is_pr_remediation else "toggled_development",
+                input_tokens=len(user_input) // 4,
+                output_tokens=len(response) // 4,
+            )
+            if not push_success:
                 print(f"[ERROR] Git push failed: {push_res.stderr} (stdout: {push_res.stdout})")
 
             if not is_pr_remediation:
