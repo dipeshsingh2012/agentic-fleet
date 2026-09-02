@@ -137,26 +137,67 @@ class LLMRunner:
         # Default / Fallback: Google Gemini
         return await self._generate_gemini(system_instruction, prompt_text, dry_run=dry_run, tier=tier)
 
+    def _get_gemini_candidate_models(self, tier: str = "fast") -> List[str]:
+        """Dynamically discovers active models via Google GenAI SDK, falling back to known models."""
+        if hasattr(self, "_gemini_model_cache") and self._gemini_model_cache:
+            discovered = self._gemini_model_cache
+        else:
+            discovered = []
+            if HAS_GENAI_SDK and self.gemini_api_key:
+                try:
+                    client = genai.Client(api_key=self.gemini_api_key)
+                    for m in client.models.list():
+                        name = m.name.replace("models/", "")
+                        if not m.supported_actions or "generateContent" in m.supported_actions:
+                            discovered.append(name)
+                    self._gemini_model_cache = discovered
+                    if discovered:
+                        print(f"[LLM:Gemini] 📡 Discovered {len(discovered)} active models from Google API: {discovered[:6]}")
+                except Exception as e:
+                    logger.debug(f"Could not dynamically list Gemini models: {e}")
+
+        if discovered:
+            preferred = [
+                "gemini-2.0-flash",
+                "gemini-2.0-flash-lite",
+                "gemini-flash-latest",
+                "gemma-4-26b-a4b-it",
+                "gemini-1.5-flash",
+                "gemini-1.5-pro",
+            ]
+            ordered = [m for m in preferred if m in discovered]
+            for m in discovered:
+                if m not in ordered and ("gemini" in m.lower() or "gemma" in m.lower()):
+                    ordered.append(m)
+            if ordered:
+                return ordered
+
+        # Static fallback list if discovery is unavailable
+        if tier == "pro":
+            return [
+                "gemini-2.0-flash",
+                "gemini-flash-latest",
+                "gemma-4-26b-a4b-it",
+                "gemini-2.0-flash-lite",
+                "gemini-1.5-pro",
+                "gemini-1.5-flash",
+            ]
+        return [
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-flash-latest",
+            "gemma-4-26b-a4b-it",
+            "gemini-1.5-flash",
+        ]
+
     async def _generate_gemini(self, system_instruction: str, user_input: str, dry_run: bool = False, tier: str = "fast") -> str:
         """Generates response via Google GenAI SDK or REST API with model fallback."""
-        if tier == "pro":
-            models = [
-                "gemini-1.5-pro",
-                "gemini-2.0-flash",
-                "gemini-2.0-flash-lite",
-                "gemini-1.5-flash",
-            ]
-        else:
-            models = [
-                "gemini-2.0-flash",
-                "gemini-2.0-flash-lite",
-                "gemini-1.5-flash",
-                "gemini-1.5-pro",
-            ]
-
+        models = self._get_gemini_candidate_models(tier=tier)
         last_error = None
+
         for model_name in models:
-            # Try GenAI SDK
+            print(f"[LLM:Gemini] 🔄 Attempting generation with model: {model_name} (tier: {tier})...")
+            # 1. Try GenAI SDK
             if HAS_GENAI_SDK and self.gemini_api_key:
                 try:
                     client = genai.Client(api_key=self.gemini_api_key)
@@ -170,14 +211,15 @@ class LLMRunner:
                         config=config,
                     )
                     if resp and resp.text:
-                        print(f"[LLM:Gemini] ✅ Generated response using model: {model_name}")
+                        print(f"[LLM:Gemini] ✅ Successfully generated response using model: {model_name}")
                         return resp.text
                 except Exception as e:
                     last_error = e
+                    print(f"[LLM:Gemini] ⚠️ Model {model_name} (SDK) failed: {e}")
                     if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
                         await asyncio.sleep(2)
 
-            # Try Gemini REST API
+            # 2. Try Gemini REST API
             if self.gemini_api_key:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.gemini_api_key}"
@@ -194,12 +236,16 @@ class LLMRunner:
                             if candidates:
                                 text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                                 if text:
-                                    print(f"[LLM:Gemini-REST] ✅ Generated response using model: {model_name}")
+                                    print(f"[LLM:Gemini-REST] ✅ Successfully generated response using model: {model_name}")
                                     return text
-                        elif resp.status_code == 429:
-                            await asyncio.sleep(2)
+                        else:
+                            last_error = f"HTTP {resp.status_code}: {resp.text}"
+                            print(f"[LLM:Gemini-REST] ⚠️ Model {model_name} (REST) failed with HTTP {resp.status_code}: {resp.text[:120]}")
+                            if resp.status_code == 429:
+                                await asyncio.sleep(2)
                 except Exception as e:
                     last_error = e
+                    print(f"[LLM:Gemini-REST] ⚠️ REST request for {model_name} failed: {e}")
 
         if not self.gemini_api_key or dry_run:
             return (
