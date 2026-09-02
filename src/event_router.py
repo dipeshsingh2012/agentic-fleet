@@ -371,7 +371,7 @@ class EventRouter:
             action_type = payload.get("action", "") or payload.get("event_type", "")
             client_payload = payload.get("client_payload", {})
             title = client_payload.get("title") or "Autonomous Feature Initiative"
-            initiative_id = client_payload.get("initiative_id") or "mcp-initiative"
+            initiative_id = client_payload.get("initiative_id") or client_payload.get("id") or client_payload.get("item_id") or "mcp-initiative"
             feedback = client_payload.get("feedback") or ""
             prompt_text = client_payload.get("prompt") or feedback or title
 
