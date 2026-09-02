@@ -56,5 +56,6 @@ gcp-key.json
 
 # Local Test Sandbox Artifacts
 backend/
-docs/
+docs/design/
+docs/prs/
 
