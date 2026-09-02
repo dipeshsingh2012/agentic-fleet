@@ -10,7 +10,7 @@ def test_load_prompt_and_substitute():
         {"issue_title": "Custom Feature", "issue_body": "Custom Body text"},
     )
     assert "pm-agent" in prompt
-    assert "User Stories" in prompt
+    assert "User Story" in prompt
 
 
 def test_load_all_prompts():

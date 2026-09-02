@@ -277,10 +277,12 @@ async def test_pipeline_execution_is_strictly_linear_and_acyclic(tmp_path: Path)
     assert result["pipeline"] == "autonomous-5-agent-sdlc"
     assert result["status"] == "completed_awaiting_human_merge"
 
-    # 2. Stage keys are exactly the 5 distinct roles, executed once each
+    # 2. Stage keys are exactly the distinct roles, executed once each in acyclic sequence
     stage_keys = list(result["stages"].keys())
     assert stage_keys == [
         "pm_agent",
+        "dev_design",
+        "architect_agent",
         "dev_agent",
         "security_agent",
         "qa_agent",

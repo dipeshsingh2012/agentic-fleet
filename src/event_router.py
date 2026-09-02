@@ -353,6 +353,10 @@ class EventRouter:
 
             if added_label == "agent:ready-for-dev" or "agent:ready-for-dev" in labels:
                 return await self.handle_dev_agent(repo_name, payload)
+            if added_label == "agent:design-review" or "agent:design-review" in labels:
+                return await self.handle_architect_agent(repo_name, payload)
+            if added_label == "agent:ready-for-design" or "agent:ready-for-design" in labels:
+                return await self.handle_dev_design(repo_name, payload)
             if added_label == "agent:pm" or "agent:pm" in labels or action == "opened":
                 return await self.handle_pm_agent(repo_name, payload)
 
@@ -386,6 +390,10 @@ class EventRouter:
                 return await self.handle_dev_agent(repo_name, payload)
 
             # 3. Explicit agent mentions
+            if "@architect-agent" in comment_body or "@architect" in comment_body:
+                return await self.handle_architect_agent(repo_name, payload)
+            if "@dev-design" in comment_body or "@design" in comment_body:
+                return await self.handle_dev_design(repo_name, payload)
             if "@dev-agent" in comment_body or "@dev" in comment_body:
                 return await self.handle_dev_agent(repo_name, payload)
             if "@pm-agent" in comment_body or "@pm" in comment_body:
@@ -450,13 +458,17 @@ class EventRouter:
         normalized = agent_name.replace("-agent", "").lower()
         if normalized == "pm":
             return await self.handle_pm_agent(repo, payload)
+        elif normalized in ["dev-design", "design"]:
+            return await self.handle_dev_design(repo, payload)
+        elif normalized in ["architect", "architect-agent"]:
+            return await self.handle_architect_agent(repo, payload)
         elif normalized == "dev":
             return await self.handle_dev_agent(repo, payload)
         elif normalized in ["sec", "security"]:
             return await self.handle_security_agent(repo, payload)
         elif normalized == "qa":
             return await self.handle_qa_agent(repo, payload)
-        elif normalized in ["reviewer", "senior-reviewer", "architect"]:
+        elif normalized in ["reviewer", "senior-reviewer"]:
             return await self.handle_senior_reviewer_agent(repo, payload)
         else:
             raise ValueError(f"Unknown agent: {agent_name}")
@@ -517,22 +529,54 @@ class EventRouter:
         # -------------------------------------------------------------
         # STAGE 1: Product Management & Specification (pm-agent)
         # -------------------------------------------------------------
-        if pr_number or "agent:ready-for-dev" in issue_labels or "ready-for-security-audit" in issue_labels:
-            print("[STAGE 1/5] ⏭️ pm-agent: Specification already accepted. Skipping duplicate framing.")
+        if pr_number or "agent:ready-for-design" in issue_labels or "agent:ready-for-dev" in issue_labels or "ready-for-security-audit" in issue_labels:
+            print("[STAGE 1/6] ⏭️ pm-agent: Specification already accepted. Skipping duplicate framing.")
             pipeline_summary["stages"]["pm_agent"] = {"status": "skipped", "reason": "already_completed"}
         else:
-            print("[STAGE 1/5] 🎯 Running pm-agent (Specification & Gherkin ACs)...")
+            print("[STAGE 1/6] 🎯 Running pm-agent (Triage, Clarification & PRD)...")
             pm_result = await self.handle_pm_agent(repo, payload)
             pipeline_summary["stages"]["pm_agent"] = pm_result
 
+            if pm_result.get("action") == "clarification_requested":
+                print("\n[HALT] ❓ pm-agent requested requirements clarification. Halting pipeline to await human input.")
+                pipeline_summary["status"] = "awaiting_clarification"
+                return pipeline_summary
+
         # -------------------------------------------------------------
-        # STAGE 2: Autonomous Development & PR Creation (dev-agent)
+        # STAGE 2: Technical Design Document (dev-agent Phase 1)
+        # -------------------------------------------------------------
+        if pr_number or "agent:design-approved" in issue_labels or "agent:ready-for-dev" in issue_labels:
+            print("[STAGE 2/6] ⏭️ dev-agent: Design document already approved. Skipping duplicate design phase.")
+            pipeline_summary["stages"]["dev_design"] = {"status": "skipped", "reason": "already_approved"}
+        else:
+            print("\n[STAGE 2/6] 📐 Running dev-agent (Authoring docs/design/DESIGN-...)...")
+            design_result = await self.handle_dev_design(repo, payload)
+            pipeline_summary["stages"]["dev_design"] = design_result
+
+        # -------------------------------------------------------------
+        # STAGE 3: Pre-Implementation Architect Review Gate (architect-agent Gate 1)
+        # -------------------------------------------------------------
+        if pr_number or "agent:design-approved" in issue_labels or "agent:ready-for-dev" in issue_labels:
+            print("[STAGE 3/6] ⏭️ architect-agent: Design review already signed off. Skipping duplicate gate.")
+            pipeline_summary["stages"]["architect_agent"] = {"status": "skipped", "verdict": "DESIGN_APPROVED"}
+        else:
+            print("\n[STAGE 3/6] 🏛️ Running architect-agent (Pre-Implementation Design Audit Gate)...")
+            arch_result = await self.handle_architect_agent(repo, payload)
+            pipeline_summary["stages"]["architect_agent"] = arch_result
+
+            if arch_result.get("verdict") == "CHANGES_REQUESTED" and not self.dry_run:
+                print("\n[HALT] 🛑 architect-agent requested design changes. Halting pipeline before code implementation.")
+                pipeline_summary["status"] = "design_changes_requested"
+                return pipeline_summary
+
+        # -------------------------------------------------------------
+        # STAGE 4: Autonomous Development & PR Creation (dev-agent Phase 2)
         # -------------------------------------------------------------
         if pr_number:
-            print(f"[STAGE 2/5] ⏭️ dev-agent: Pull Request #{pr_number} on `{branch_name}` already open. Skipping initial creation.")
+            print(f"[STAGE 4/6] ⏭️ dev-agent: Pull Request #{pr_number} on `{branch_name}` already open. Skipping initial creation.")
             pipeline_summary["stages"]["dev_agent"] = {"status": "skipped", "pr_number": pr_number, "branch_name": branch_name}
         else:
-            print("\n[STAGE 2/5] 🧑‍💻 Running dev-agent (Branching, Implementation & PR Opening)...")
+            print("\n[STAGE 4/6] 🧑‍💻 Running dev-agent (Branching, Implementation & PR Opening)...")
             dev_result = await self.handle_dev_agent(repo, payload)
             pipeline_summary["stages"]["dev_agent"] = dev_result
             pr_number = dev_result.get("pr_number")
@@ -545,6 +589,8 @@ class EventRouter:
                 halt_comment = (
                     f"## ⚠️ Autonomous Pipeline Halted: Pull Request Creation Required\n\n"
                     f"- 🎯 **`pm-agent`**: Specification generated.\n"
+                    f"- 📐 **`dev-agent`**: Design document authored.\n"
+                    f"- 🏛️ **`architect-agent`**: Design approved.\n"
                     f"- 🧑‍💻 **`dev-agent`**: Materialized files on branch `{branch_name}`.\n\n"
                     f"⛔ **Action Required**: The automated Pull Request could not be created automatically.\n"
                     f"1. Ensure **'Allow GitHub Actions to create and approve pull requests'** is enabled in repository settings (`Settings` -> `Actions` -> `General` -> `Workflow permissions`).\n"
@@ -563,14 +609,14 @@ class EventRouter:
         }
 
         # -------------------------------------------------------------
-        # STAGE 3: Security & Multi-Tenant Audit (security-agent)
+        # STAGE 5: Security & Multi-Tenant Audit (security-agent)
         # -------------------------------------------------------------
         if "security:passed" in pr_labels and not self.dry_run:
-            print(f"[STAGE 3/5] ⏭️ security-agent: Multi-tenant audit already passed (security:passed). Skipping duplicate review.")
+            print(f"[STAGE 5/6] ⏭️ security-agent: Multi-tenant audit already passed (security:passed). Skipping duplicate review.")
             pipeline_summary["stages"]["security_agent"] = {"status": "skipped", "verdict": "PASSED"}
             is_sec_blocked = False
         else:
-            print(f"\n[STAGE 3/5] 🛡️ Running security-agent for PR #{effective_pr_number}...")
+            print(f"\n[STAGE 5/6] 🛡️ Running security-agent for PR #{effective_pr_number}...")
             sec_result = await self.handle_security_agent(repo, pr_payload)
             pipeline_summary["stages"]["security_agent"] = sec_result
 
@@ -578,7 +624,7 @@ class EventRouter:
             is_sec_blocked = False if self.dry_run else ("STATUS: BLOCKED" in sec_response or "VERDICT: BLOCKED" in sec_response or "STATUS: FAILED" in sec_response)
 
             if is_sec_blocked:
-                print("\n[STAGE 3.1] ⚠️ Security defects detected. Invoking dev-agent to remediate...")
+                print("\n[STAGE 5.1] ⚠️ Security defects detected. Invoking dev-agent to remediate...")
                 remediation_payload = {
                     "repository": {"full_name": repo},
                     "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
@@ -587,21 +633,21 @@ class EventRouter:
                 remed_result = await self.handle_dev_agent(repo, remediation_payload)
                 pipeline_summary["stages"]["security_remediation"] = remed_result
 
-                print("[STAGE 3.2] 🛡️ Re-auditing security post-remediation...")
+                print("[STAGE 5.2] 🛡️ Re-auditing security post-remediation...")
                 sec_result = await self.handle_security_agent(repo, pr_payload)
                 pipeline_summary["stages"]["security_agent_recheck"] = sec_result
                 sec_response = sec_result.get("response", "")
                 is_sec_blocked = False if self.dry_run else ("STATUS: BLOCKED" in sec_response or "VERDICT: BLOCKED" in sec_response or "STATUS: FAILED" in sec_response)
 
         # -------------------------------------------------------------
-        # STAGE 4: Adversarial QA & Test Execution (qa-agent & dev remediation)
+        # STAGE 5b: Adversarial QA & Test Execution (qa-agent & dev remediation)
         # -------------------------------------------------------------
         if "qa:passed" in pr_labels and not self.dry_run and not is_sec_blocked:
-            print(f"[STAGE 4/5] ⏭️ qa-agent: QA verification already passed (qa:passed). Skipping duplicate review.")
+            print(f"[STAGE 5.3] ⏭️ qa-agent: QA verification already passed (qa:passed). Skipping duplicate review.")
             pipeline_summary["stages"]["qa_agent"] = {"status": "skipped", "verdict": "PASSED"}
             is_qa_failed = False
         else:
-            print(f"\n[STAGE 4/5] 🧪 Running qa-agent against current branch `{branch_name}` for PR #{effective_pr_number}...")
+            print(f"\n[STAGE 5.3] 🧪 Running qa-agent against current branch `{branch_name}` for PR #{effective_pr_number}...")
             qa_result = await self.handle_qa_agent(repo, pr_payload)
             pipeline_summary["stages"]["qa_agent"] = qa_result
 
@@ -609,7 +655,7 @@ class EventRouter:
             is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
 
             if is_qa_failed:
-                print("\n[STAGE 4.1] ⚠️ QA defects / test failures detected. Invoking dev-agent to remediate on branch...")
+                print("\n[STAGE 5.4] ⚠️ QA defects / test failures detected. Invoking dev-agent to remediate on branch...")
                 remediation_payload = {
                     "repository": {"full_name": repo},
                     "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
@@ -618,7 +664,7 @@ class EventRouter:
                 remed_qa_result = await self.handle_dev_agent(repo, remediation_payload)
                 pipeline_summary["stages"]["qa_remediation"] = remed_qa_result
 
-                print("[STAGE 4.2] 🧪 Re-running QA verification post-remediation...")
+                print("[STAGE 5.5] 🧪 Re-running QA verification post-remediation...")
                 qa_result = await self.handle_qa_agent(repo, pr_payload)
                 pipeline_summary["stages"]["qa_agent_recheck"] = qa_result
                 qa_response = qa_result.get("response", "")
@@ -633,6 +679,8 @@ class EventRouter:
                 halt_comment = (
                     f"## 🛑 Autonomous Pipeline Halted: QA Test Execution / Collection Failed\n\n"
                     f"- 🎯 **`pm-agent`**: Specification accepted.\n"
+                    f"- 📐 **`dev-agent`**: Design document authored.\n"
+                    f"- 🏛️ **`architect-agent`**: Design approved.\n"
                     f"- 🧑‍💻 **`dev-agent`**: Implementation pushed to `{branch_name}`.\n"
                     f"- 🛡️ **`security-agent`**: Security audit complete.\n"
                     f"- 🧪 **`qa-agent`**: **STATUS: FAILED ❌** (Test collection or execution errors detected).\n\n"
@@ -645,13 +693,13 @@ class EventRouter:
             return pipeline_summary
 
         # -------------------------------------------------------------
-        # STAGE 5: Principal Architect Review & Sign-off (senior-reviewer-agent)
+        # STAGE 6: Principal Architect Review & Sign-off (senior-reviewer-agent)
         # -------------------------------------------------------------
         if "status:approved" in pr_labels and "ready-for-merge" in pr_labels and not is_sec_blocked and not is_qa_failed and not self.dry_run:
-            print(f"[STAGE 5/5] ⏭️ senior-reviewer-agent: PR #{effective_pr_number} already APPROVED. Skipping duplicate review.")
+            print(f"[STAGE 6/6] ⏭️ senior-reviewer-agent: PR #{effective_pr_number} already APPROVED. Skipping duplicate review.")
             pipeline_summary["stages"]["senior_reviewer_agent"] = {"status": "skipped", "verdict": "APPROVED"}
         else:
-            print(f"\n[STAGE 5/5] 🧙‍♂️ Running senior-reviewer-agent (ADR Audit & Approval)...")
+            print(f"\n[STAGE 6/6] 🧙‍♂️ Running senior-reviewer-agent (ADR Audit & Approval)...")
             reviewer_result = await self.handle_senior_reviewer_agent(repo, pr_payload)
             pipeline_summary["stages"]["senior_reviewer_agent"] = reviewer_result
 
@@ -661,13 +709,15 @@ class EventRouter:
         if not self.dry_run and pr_number and repo:
             await self.github_client.add_labels(repo, pr_number, ["ready-for-merge", "status:approved"])
             final_comment = (
-                f"## 🚀 Autonomous 5-Agent SDLC Pipeline: Ready for Merge\n\n"
-                f"All quality and compliance gates are verified:\n"
+                f"## 🚀 Autonomous 6-Stage SDLC Pipeline: Ready for Merge\n\n"
+                f"All quality, design, and compliance gates are verified:\n"
                 f"- 🎯 **`pm-agent`**: User Story & Gherkin specifications accepted.\n"
+                f"- 📐 **`dev-agent`**: Technical Design Document created (`docs/design/`).\n"
+                f"- 🏛️ **`architect-agent`**: Pre-implementation design reviewed & **APPROVED ✅**.\n"
                 f"- 🧑‍💻 **`dev-agent`**: Code and unit tests authored on branch `{branch_name}`.\n"
                 f"- 🛡️ **`security-agent`**: Multi-tenant isolation & secrets audit ({sec_status_icon}).\n"
                 f"- 🧪 **`qa-agent`**: Adversarial edge cases & regression tests ({qa_status_icon}).\n"
-                f"- 🧙‍♂️ **`senior-reviewer-agent`**: ADR compliance validated and PR **APPROVED (`LGTM ✅`)**.\n\n"
+                f"- 🧙‍♂️ **`senior-reviewer-agent`**: PR diff validated against ADRs & **APPROVED (`LGTM ✅`)**.\n\n"
                 f"👉 **Human Sign-Off Gate**: Pull Request [**#{pr_number}**](https://github.com/{repo}/pull/{pr_number}) is ready for your final merge!"
             )
             target_comment_id = pr_number or (issue_number if isinstance(issue_number, int) else None)
@@ -681,14 +731,26 @@ class EventRouter:
         return pipeline_summary
 
     async def handle_pm_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """pm-agent: formats user story, Gherkin criteria, and RICE score with full workspace context."""
+        """pm-agent: clarifies vague tickets or formats full Living PRD spec and Gherkin criteria."""
         workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
         ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
 
         issue = payload.get("issue", {})
         issue_number = issue.get("number", 1)
         issue_title = issue.get("title", "Feature Request")
-        issue_body = issue.get("body", "")
+        issue_body = issue.get("body", "") or ""
+        comment_body = payload.get("comment", {}).get("body", "") or ""
+
+        # Check if issue is underspecified/vague (e.g. body < 80 chars, no prior answers, and not MCP/synthetic)
+        has_human_answers = any(
+            ans in comment_body.lower() or ans in issue_body.lower()
+            for ans in ["1a", "1b", "1c", "2a", "2b", "proceed with defaults", "@fleet defaults", "@fleet proceed"]
+        )
+        is_synthetic_or_mcp = payload.get("client_payload") is not None or "source:mcp" in [lbl.get("name", "") for lbl in issue.get("labels", [])]
+        is_vague = (
+            payload.get("force_clarify") is True
+            or (len(issue_body.strip()) < 80 and not has_human_answers and not is_synthetic_or_mcp and not self.dry_run)
+        )
 
         prompt = self.llm_runner.load_prompt(
             "pm-agent",
@@ -698,18 +760,145 @@ class EventRouter:
             workspace_info=ws_info,
             issue_info={"number": issue_number, "title": issue_title, "body": issue_body},
         )
-        user_input = f"{context_block}\n\nPlease author the user story, Gherkin acceptance criteria, and RICE score for Issue #{issue_number}."
+
+        if is_vague:
+            user_input = (
+                f"{context_block}\n\n"
+                f"Issue #{issue_number} is underspecified or a one-liner: '{issue_title}'.\n"
+                f"Please generate the MODE 1: Interactive Clarification Questionnaire with 2-4 structured questions and (Recommended) options."
+            )
+            response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="fast")
+            if not self.dry_run and isinstance(issue_number, int) and repo:
+                await self.github_client.create_issue_comment(repo, issue_number, response)
+                await self.github_client.add_labels(repo, issue_number, ["status:needs-clarification"])
+
+            return {
+                "agent": "pm-agent",
+                "action": "clarification_requested",
+                "issue_number": issue_number,
+                "response": response,
+            }
+        else:
+            user_input = (
+                f"{context_block}\n\n"
+                f"Please author the full product specification, Gherkin acceptance criteria, and RICE score for Issue #{issue_number}: {issue_title}."
+            )
+            if has_human_answers:
+                user_input += f"\n\nAuthor's Clarification Input:\n{comment_body or issue_body}"
+
+            response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="fast")
+            if not self.dry_run and isinstance(issue_number, int) and repo:
+                await self.github_client.create_issue_comment(repo, issue_number, response)
+                await self.github_client.remove_label(repo, issue_number, "agent:pm")
+                await self.github_client.remove_label(repo, issue_number, "status:needs-clarification")
+                await self.github_client.add_labels(repo, issue_number, ["agent:ready-for-design"])
+
+            return {
+                "agent": "pm-agent",
+                "action": "formatted_spec",
+                "issue_number": issue_number,
+                "response": response,
+            }
+
+    async def handle_dev_design(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """dev-agent (Phase 1): generates structured Technical Design Document in docs/design/DESIGN-<id>.md."""
+        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
+
+        issue = payload.get("issue", {})
+        issue_number = issue.get("number", 1)
+        issue_title = issue.get("title", "Technical Design")
+        issue_body = issue.get("body", "")
+
+        slug = re.sub(r"[^a-z0-9]+", "-", issue_title.lower()).strip("-")[:30] or "design"
+        design_dir = workspace_dir / "docs" / "design"
+        design_dir.mkdir(parents=True, exist_ok=True)
+        design_file = design_dir / f"DESIGN-{issue_number}-{slug}.md"
+
+        prompt = self.llm_runner.load_prompt(
+            "dev-agent",
+            {"issue_number": issue_number, "issue_title": issue_title, "issue_body": issue_body, "branch_name": f"design/{issue_number}"},
+        )
+        context_block = AgentContextBuilder.format_context_block(
+            workspace_info=ws_info,
+            issue_info={"number": issue_number, "title": issue_title, "body": issue_body},
+        )
+        user_input = (
+            f"{context_block}\n\n"
+            f"Author the PHASE 1: TECHNICAL DESIGN DOCUMENT for Issue #{issue_number}: {issue_title}.\n"
+            f"Adhere strictly to the Technical Design Document format including Architecture Mermaid diagram, File Impact Matrix, Data Models, Multi-tenancy, and Test Strategy."
+        )
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="fast")
+
+        design_file.write_text(response, encoding="utf-8")
+        print(f"[DEV-AGENT] 📐 Authored Technical Design Document: {design_file.relative_to(workspace_dir)}")
+
+        if not self.dry_run and isinstance(issue_number, int) and repo:
+            await self.github_client.create_issue_comment(repo, issue_number, f"## 📐 `dev-agent` Technical Design Document\n\n{response}")
+            await self.github_client.remove_label(repo, issue_number, "agent:ready-for-design")
+            await self.github_client.add_labels(repo, issue_number, ["agent:design-review"])
+
+        return {
+            "agent": "dev-agent",
+            "action": "design_authored",
+            "issue_number": issue_number,
+            "design_file": str(design_file.relative_to(workspace_dir)),
+            "response": response,
+        }
+
+    async def handle_architect_agent(self, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """architect-agent (Gate 1): reviews docs/design/DESIGN-<id>.md before code implementation."""
+        workspace_dir = Path(os.getenv("TARGET_WORKSPACE", os.getcwd()))
+        ws_info = AgentContextBuilder.inspect_workspace(workspace_dir)
+
+        issue = payload.get("issue", {})
+        issue_number = issue.get("number", 1)
+        issue_title = issue.get("title", "Architecture Review")
+        issue_body = issue.get("body", "")
+
+        design_dir = workspace_dir / "docs" / "design"
+        design_content = ""
+        if design_dir.exists():
+            for f in design_dir.glob(f"DESIGN-{issue_number}*.md"):
+                design_content = f.read_text(encoding="utf-8")
+                break
+
+        if not design_content:
+            design_content = issue_body
+
+        prompt = self.llm_runner.load_prompt(
+            "architect-agent",
+            {"issue_number": issue_number, "issue_title": issue_title, "repo_name": repo},
+        )
+        context_block = AgentContextBuilder.format_context_block(
+            workspace_info=ws_info,
+            issue_info={"number": issue_number, "title": issue_title, "body": issue_body},
+        )
+        user_input = (
+            f"{context_block}\n\n"
+            f"### Technical Design Document under Review:\n\n{design_content}\n\n"
+            f"Please audit this technical design against ADRs, multi-tenant isolation, data models, and test strategy."
+        )
+        response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="pro")
+
+        is_approved = (
+            self.dry_run
+            or ("DESIGN_APPROVED" in response or "APPROVED" in response or "LGTM" in response or "PASSED" in response)
+        ) and "CHANGES_REQUESTED" not in response
 
         if not self.dry_run and isinstance(issue_number, int) and repo:
             await self.github_client.create_issue_comment(repo, issue_number, response)
-            await self.github_client.remove_label(repo, issue_number, "agent:pm")
-            await self.github_client.add_labels(repo, issue_number, ["agent:ready-for-dev"])
+            if is_approved:
+                await self.github_client.remove_label(repo, issue_number, "agent:design-review")
+                await self.github_client.add_labels(repo, issue_number, ["agent:design-approved", "agent:ready-for-dev"])
+            else:
+                await self.github_client.add_labels(repo, issue_number, ["status:changes-requested"])
 
         return {
-            "agent": "pm-agent",
-            "action": "formatted_spec",
+            "agent": "architect-agent",
+            "action": "design_reviewed",
             "issue_number": issue_number,
+            "verdict": "DESIGN_APPROVED" if is_approved else "CHANGES_REQUESTED",
             "response": response,
         }
 
