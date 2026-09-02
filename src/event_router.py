@@ -564,8 +564,25 @@ class EventRouter:
             arch_result = await self.handle_architect_agent(repo, payload)
             pipeline_summary["stages"]["architect_agent"] = arch_result
 
+            # Closed-Loop Design Self-Healing: if changes are requested, invoke Dev Agent to revise docs/design/!
+            max_design_remediations = int(os.getenv("MAX_DESIGN_REMEDIATIONS", "3"))
+            iteration = 1
+            while arch_result.get("verdict") == "CHANGES_REQUESTED" and iteration <= max_design_remediations:
+                print(f"\n[STAGE 3.{iteration}] ⚠️ Architect requested design changes (Iteration {iteration}/{max_design_remediations}). Invoking dev-agent to revise design document...")
+                revision_payload = {
+                    **payload,
+                    "architect_feedback": arch_result.get("response", ""),
+                }
+                dev_design_result = await self.handle_dev_design(repo, revision_payload)
+                pipeline_summary["stages"][f"dev_design_revision_{iteration}"] = dev_design_result
+
+                print(f"[STAGE 3.{iteration}b] 🏛️ Re-auditing revised design document...")
+                arch_result = await self.handle_architect_agent(repo, payload)
+                pipeline_summary["stages"][f"architect_agent_recheck_{iteration}"] = arch_result
+                iteration += 1
+
             if arch_result.get("verdict") == "CHANGES_REQUESTED" and not self.dry_run:
-                print("\n[HALT] 🛑 architect-agent requested design changes. Halting pipeline before code implementation.")
+                print("\n[HALT] 🛑 architect-agent design changes could not be resolved after max remediation attempts. Halting pipeline.")
                 pipeline_summary["status"] = "design_changes_requested"
                 return pipeline_summary
 
@@ -823,11 +840,21 @@ class EventRouter:
             workspace_info=ws_info,
             issue_info={"number": issue_number, "title": issue_title, "body": issue_body},
         )
-        user_input = (
-            f"{context_block}\n\n"
-            f"Author the PHASE 1: TECHNICAL DESIGN DOCUMENT for Issue #{issue_number}: {issue_title}.\n"
-            f"Adhere strictly to the Technical Design Document format including Architecture Mermaid diagram, File Impact Matrix, Data Models, Multi-tenancy, and Test Strategy."
-        )
+        architect_feedback = payload.get("architect_feedback") or ""
+        if architect_feedback:
+            user_input = (
+                f"{context_block}\n\n"
+                f"The Principal Architect reviewed your previous design document and requested the following changes:\n\n"
+                f"### Architect Review Findings:\n{architect_feedback}\n\n"
+                f"Please update and refine the PHASE 1: TECHNICAL DESIGN DOCUMENT for Issue #{issue_number}: {issue_title} to resolve all concerns.\n"
+                f"Adhere strictly to the Technical Design Document format."
+            )
+        else:
+            user_input = (
+                f"{context_block}\n\n"
+                f"Author the PHASE 1: TECHNICAL DESIGN DOCUMENT for Issue #{issue_number}: {issue_title}.\n"
+                f"Adhere strictly to the Technical Design Document format including Architecture Mermaid diagram, File Impact Matrix, Data Models, Multi-tenancy, and Test Strategy."
+            )
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="fast")
 
         design_file.write_text(response, encoding="utf-8")

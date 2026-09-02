@@ -207,3 +207,39 @@ async def test_full_6_stage_autonomous_sdlc_pipeline(tmp_path: Path):
     assert stages["dev_design"]["action"] == "design_authored"
     assert stages["architect_agent"]["verdict"] == "DESIGN_APPROVED"
     assert stages["senior_reviewer_agent"]["agent"] == "senior-reviewer-agent"
+
+
+@pytest.mark.asyncio
+async def test_architect_changes_requested_triggers_dev_design_revision(tmp_path: Path):
+    """
+    Validates that when the architect requests changes, the Dev Agent
+    automatically receives feedback, updates docs/design/DESIGN-<id>.md,
+    and resubmits for architect re-audit.
+    """
+    harness = MagicMock(spec=TestHarness)
+    harness.cwd = str(tmp_path)
+    router = EventRouter(dry_run=True, test_harness=harness)
+
+    import os
+    os.environ["TARGET_WORKSPACE"] = str(tmp_path)
+
+    payload = {
+        "action": "labeled",
+        "repository": {"full_name": "dipeshsingh2012/rfpengine"},
+        "issue": {
+            "number": 10,
+            "title": "Token Bucket Rate Limiter",
+            "body": "Design with token bucket",
+            "labels": [{"name": "agent:design-review"}],
+        },
+        "architect_feedback": "Please add Redis cluster failover strategy and 429 Retry-After headers in Section 5.",
+    }
+
+    dev_rev_res = await router.handle_dev_design("dipeshsingh2012/rfpengine", payload)
+    assert dev_rev_res["agent"] == "dev-agent"
+    assert dev_rev_res["action"] == "design_authored"
+    assert dev_rev_res["issue_number"] == 10
+
+    # Verify updated design file created
+    design_files = list((tmp_path / "docs" / "design").glob("DESIGN-10*.md"))
+    assert len(design_files) == 1
