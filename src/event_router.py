@@ -195,10 +195,15 @@ class EventRouter:
         for rel_path, file_code in files.items():
             target_rel = rel_path
             # If repo has backend/ layout and path starts with app/ or tests/, map to backend/
-            if has_backend_dir and not target_rel.startswith("backend/") and (target_rel.startswith("app/") or target_rel.startswith("tests/")):
-                target_rel = f"backend/{target_rel}"
+            # Security hardening: Prevent directory traversal outside of workspace root
+            try:
+                target_path = (workspace_dir / target_rel).resolve()
+                if not target_path.is_relative_to(workspace_dir.resolve()):
+                    print(f"[SECURITY] 🛑 Blocked path traversal attempt: {target_rel}")
+                    continue
+            except Exception:
+                continue
 
-            target_path = workspace_dir / target_rel
             target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(file_code.strip() + "\n", encoding="utf-8")
             materialized[target_rel] = file_code

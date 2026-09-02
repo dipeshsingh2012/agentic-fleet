@@ -98,8 +98,9 @@ class TestHarness:
             )
 
         duration = round(time.time() - start_time, 2)
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        stdout = self._redact_secrets(stdout_bytes.decode("utf-8", errors="replace"))
+        stderr = self._redact_secrets(stderr_bytes.decode("utf-8", errors="replace"))
+        safe_command = self._redact_secrets(command)
 
         total, passed, failed, skipped = self._parse_pytest_counts(stdout + "\n" + stderr)
 
@@ -110,7 +111,7 @@ class TestHarness:
             total = max(total, passed + failed)
 
         return TestResult(
-            command=command,
+            command=safe_command,
             exit_code=exit_code,
             duration_seconds=duration,
             stdout=stdout,
@@ -120,6 +121,16 @@ class TestHarness:
             failed_tests=failed,
             skipped_tests=skipped,
         )
+
+    def _redact_secrets(self, text: str) -> str:
+        """Redacts sensitive tokens, API keys, and authorization headers from logs."""
+        if not text:
+            return ""
+        # Redact GitHub token URLs: https://x-access-token:ghs_...@github.com
+        text = re.sub(r"(https://[^:]+:)[^@]+(@github\.com)", r"\1***\2", text)
+        # Redact generic bearer tokens
+        text = re.sub(r"(Bearer\s+)[A-Za-z0-9_\-\.]{16,}", r"\1***", text)
+        return text
 
     def _parse_pytest_counts(self, output: str) -> tuple[int, int, int, int]:
         """Extract test counts from pytest or vitest output."""
