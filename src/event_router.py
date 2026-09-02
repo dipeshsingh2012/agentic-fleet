@@ -587,18 +587,23 @@ class EventRouter:
             branch_name = pr_payload_obj["head"]["ref"]
 
         pr_number = self._extract_pr_number(payload)
-        pr_labels = []
+        pr_labels = [lbl.get("name", "") for lbl in payload.get("pull_request", {}).get("labels", []) if isinstance(lbl, dict)]
+        if not pr_labels and "issue" in payload and "pull_request" in payload.get("issue", {}):
+            pr_labels = [lbl.get("name", "") for lbl in payload.get("issue", {}).get("labels", []) if isinstance(lbl, dict)]
+
         if not pr_number and not self.dry_run and repo:
             existing_pr = await self.github_client.find_existing_pr(repo, branch_name)
             if not existing_pr:
                 existing_pr = await self.github_client.find_existing_pr(repo, f"feat/{issue_number}")
             if existing_pr:
                 pr_number = existing_pr.get("number")
-                pr_labels = [lbl.get("name", "") for lbl in existing_pr.get("labels", [])]
+                pr_labels = [lbl.get("name", "") for lbl in existing_pr.get("labels", []) if isinstance(lbl, dict)]
         elif pr_number and not self.dry_run and repo:
             try:
                 pr_data = await self.github_client.get_pull_request(repo, pr_number)
-                pr_labels = [lbl.get("name", "") for lbl in pr_data.get("labels", [])]
+                fetched_labels = [lbl.get("name", "") for lbl in pr_data.get("labels", []) if isinstance(lbl, dict)]
+                if fetched_labels:
+                    pr_labels = fetched_labels
                 branch_name = pr_data.get("head", {}).get("ref", branch_name)
             except Exception as e:
                 print(f"[WARN] Failed fetching PR metadata: {e}")
@@ -749,14 +754,42 @@ class EventRouter:
             payload.get("comment", {}).get("body", "")
             or payload.get("review", {}).get("body", "")
         ).lower()
-        is_dev_requested = any(k in comment_body_text for k in ["@dev-agent", "@dev", "implement", "code", "materialize", "remediate", "action required"])
+        is_dev_requested = any(
+            k in comment_body_text
+            for k in [
+                "@dev-agent",
+                "@dev",
+                "implement",
+                "code",
+                "materialize",
+                "remediate",
+                "action required",
+                "fix",
+                "update",
+                "resolve",
+                "address",
+                "patch",
+            ]
+        )
+        is_remediation_needed = any(
+            l in pr_labels
+            for l in [
+                "security:blocked",
+                "qa:failed",
+                "status:changes-requested",
+                "needs-remediation",
+                "agent:remediation",
+                "ready-for-dev",
+                "agent:ready-for-dev",
+            ]
+        )
 
-        # If PR already open, already has source files, and not explicitly requesting dev implementation:
-        if pr_number and has_source_files and not (is_comment_trigger and is_dev_requested):
+        # If PR already open, already has source files, and not explicitly requesting dev implementation, AND not in a defect/blocked state:
+        if pr_number and has_source_files and not (is_comment_trigger and is_dev_requested) and not is_remediation_needed:
             print(f"[STAGE 4/6] ⏭️ dev-agent: Pull Request #{pr_number} on `{branch_name}` already open. Skipping initial creation.")
             pipeline_summary["stages"]["dev_agent"] = {"status": "skipped", "pr_number": pr_number, "branch_name": branch_name}
         else:
-            action_desc = f"Updating / Materializing source files on `{branch_name}` for PR #{pr_number}" if pr_number else f"Branching `{branch_name}`, Implementation & PR Opening"
+            action_desc = f"Remediating / Updating source files on `{branch_name}` for PR #{pr_number}" if pr_number else f"Branching `{branch_name}`, Implementation & PR Opening"
             print(f"\n[STAGE 4/6] 🧑‍💻 Running dev-agent ({action_desc})...")
             dev_result = await self.handle_dev_agent(repo, payload)
             pipeline_summary["stages"]["dev_agent"] = dev_result
@@ -789,8 +822,10 @@ class EventRouter:
             "issue": {"number": effective_pr_number, "pull_request": {}},
         }
 
-        # If triggered by a human comment on PR requesting changes or code, re-audit the newly pushed code
-        if is_comment_trigger:
+        # If dev-agent just ran remediation or triggered by a comment, reset stale status flags to evaluate clean diff
+        if "dev_agent" in pipeline_summary["stages"] and pipeline_summary["stages"]["dev_agent"].get("status") != "skipped":
+            pr_labels = [l for l in pr_labels if l not in ["security:passed", "security:blocked", "qa:passed", "qa:failed", "status:approved", "ready-for-merge"]]
+        elif is_comment_trigger:
             pr_labels = [l for l in pr_labels if l not in ["security:passed", "qa:passed", "status:approved", "ready-for-merge"]]
 
         # -------------------------------------------------------------

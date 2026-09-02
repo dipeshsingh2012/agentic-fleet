@@ -325,3 +325,86 @@ async def test_autonomous_pipeline_in_flight_design_self_healing(tmp_path: Path)
         "dipeshsingh2012/rfpengine", 13, ["agent:design-approved", "agent:ready-for-dev"]
     )
 
+
+@pytest.mark.asyncio
+async def test_autonomous_pipeline_remediates_when_pr_blocked_by_security(tmp_path: Path):
+    """
+    Validates that when an open PR is labeled with 'security:blocked' and @fleet is invoked
+    (even with generic phrasing like '@fleet review the security guidelines'), dev-agent is NOT
+    skipped; it automatically executes remediation, pushes a fix, and then security and QA re-audit.
+    """
+    harness = MagicMock(spec=TestHarness)
+    harness.cwd = str(tmp_path)
+    harness.run_command = AsyncMock(return_value=TestResult(command="", exit_code=0, duration_seconds=0.1, stdout="ok", stderr=""))
+    (tmp_path / "backend" / "tests").mkdir(parents=True, exist_ok=True)
+
+    import os
+    os.environ["TARGET_WORKSPACE"] = str(tmp_path)
+    os.environ["FLEET_STATE_FILE"] = str(tmp_path / "state.json")
+
+    router = EventRouter(dry_run=False, test_harness=harness)
+    mock_client = create_mock_github_client()
+    mock_client.get_pull_request = AsyncMock(
+        return_value={"number": 14, "head": {"ref": "feat/13-implement-google-sso"}, "labels": [{"name": "security:blocked"}]}
+    )
+    mock_client.get_pull_request_files = AsyncMock(return_value=[{"filename": "backend/app/main.py"}])
+    router.github_client = mock_client
+
+    responses = [
+        # 1. dev_agent remediation code
+        "def google_sso_remediated(): pass",
+        # 2. dev_agent test code
+        "def test_google_sso_remediated(): pass",
+        # 3. security-agent re-audit (now passes)
+        "STATUS: PASSED ✅ Multi-tenant isolation verified with tenant_id.",
+        # 4. qa-agent verification
+        "STATUS: PASSED ✅ 100% test pass rate.",
+        # 5. senior-reviewer sign-off
+        "STATUS: APPROVED LGTM ✅ Ready for merge.",
+    ]
+    response_iter = iter(responses)
+
+    async def mock_generate_response(*args, **kwargs):
+        try:
+            return next(response_iter)
+        except StopIteration:
+            return "STATUS: PASSED ✅"
+
+    router.llm_runner.generate_response = AsyncMock(side_effect=mock_generate_response)
+
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "dipeshsingh2012/rfpengine"},
+        "issue": {
+            "number": 14,
+            "title": "feat: implement Google SSO",
+            "body": "PR implementing Google SSO",
+            "pull_request": {},
+            "labels": [{"name": "security:blocked"}],
+        },
+        "pull_request": {
+            "number": 14,
+            "head": {"ref": "feat/13-implement-google-sso"},
+            "labels": [{"name": "security:blocked"}],
+        },
+        "comment": {
+            "body": "@fleet review the security guidelines",
+        },
+    }
+
+    result = await router.run_autonomous_pipeline("dipeshsingh2012/rfpengine", payload)
+
+    assert result["pipeline"] == "autonomous-5-agent-sdlc"
+    assert result["status"] == "completed_awaiting_human_merge"
+
+    stages = result["stages"]
+    # dev_agent should NOT be skipped; it executed remediation
+    assert stages["dev_agent"].get("status") != "skipped"
+    assert stages["dev_agent"]["agent"] == "dev-agent"
+    # security, qa, and senior reviewer should have run and passed
+    assert stages["security_agent"]["agent"] == "security-agent"
+    assert "PASSED" in stages["security_agent"]["response"]
+    assert stages["qa_agent"]["agent"] == "qa-agent"
+    assert stages["senior_reviewer_agent"]["agent"] == "senior-reviewer-agent"
+
+
