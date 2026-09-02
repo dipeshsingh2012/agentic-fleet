@@ -1,11 +1,28 @@
-name: "Autonomous Agentic Fleet Orchestrator"
-description: "Dispatches GitHub events (issues, comments, PRs) to the 5 role-bound autonomous SDLC agents"
+name: "Agentic Fleet: Autonomous 5-Agent SDLC"
+description: "Autonomous engineering fleet: PM framing, Architecture gates, TDD implementation, Security audit, and QA."
 author: "Dipesh Singh"
+
+branding:
+  icon: "cpu"
+  color: "purple"
 
 inputs:
   gemini-api-key:
-    description: "Google Gemini API Key for LLM reasoning"
-    required: true
+    description: "Google Gemini API Key for LLM reasoning (Optional if using OpenAI or Anthropic)"
+    required: false
+    default: ""
+  openai-api-key:
+    description: "OpenAI API Key for GPT-4o / o3 reasoning (Optional)"
+    required: false
+    default: ""
+  anthropic-api-key:
+    description: "Anthropic API Key for Claude 3.5 Sonnet reasoning (Optional)"
+    required: false
+    default: ""
+  ollama-host:
+    description: "Local or private Ollama host URL, e.g., http://localhost:11434 (Optional)"
+    required: false
+    default: ""
   github-token:
     description: "GitHub token for reading issues/PRs, posting reviews, adding labels, and pushing code"
     required: true
@@ -23,7 +40,7 @@ inputs:
     required: false
     default: ${{ github.event_path }}
   agent-override:
-    description: "Explicitly force execution of a specific agent (pm, dev, security, qa, senior-reviewer)"
+    description: "Explicitly force execution of a specific agent (pm, dev, security, qa, senior-reviewer, autonomous)"
     required: false
     default: ""
   dry-run:
@@ -45,15 +62,6 @@ runs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        
-        # Install target project dependencies if present (backend/requirements.txt or requirements.txt)
-        if [ -f "${{ github.workspace }}/backend/requirements.txt" ]; then
-          echo "📦 Installing target workspace backend dependencies..."
-          pip install -r "${{ github.workspace }}/backend/requirements.txt" || true
-        elif [ -f "${{ github.workspace }}/requirements.txt" ]; then
-          echo "📦 Installing target workspace dependencies..."
-          pip install -r "${{ github.workspace }}/requirements.txt" || true
-        fi
 
     - name: Execute Agentic Fleet Orchestrator
       shell: bash
@@ -61,6 +69,9 @@ runs:
       env:
         PYTHONPATH: ${{ github.action_path }}
         GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        OLLAMA_HOST: ${{ inputs.ollama-host }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         REVIEWER_GITHUB_TOKEN: ${{ inputs.reviewer-github-token }}
         GITHUB_EVENT_NAME: ${{ inputs.event-name }}

@@ -128,16 +128,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Checkout Central Agent Fleet
-        uses: actions/checkout@v4
-        with:
-          repository: dipeshsingh2012/agentic-fleet
-          path: .agentic-fleet
-
       - name: Run Agentic Fleet Action
-        uses: ./.agentic-fleet
+        uses: dipeshsingh2012/agentic-fleet@v1
         with:
           gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
+          # Or OpenAI:
+          # openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          # Or Anthropic Claude:
+          # anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
