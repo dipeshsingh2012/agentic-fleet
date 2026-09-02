@@ -352,7 +352,7 @@ class EventRouter:
             if "agent:autonomous" in labels or added_label == "agent:autonomous" or (action == "opened" and "agent:pm" not in labels and "agent:ready-for-dev" not in labels):
                 return await self.run_autonomous_pipeline(repo_name, payload)
 
-            if added_label == "agent:ready-for-dev" or "agent:ready-for-dev" in labels:
+            if added_label in ["agent:ready-for-dev", "status:changes-requested", "qa:failed", "needs-remediation"] or "agent:ready-for-dev" in labels:
                 return await self.handle_dev_agent(repo_name, payload)
             if added_label == "agent:design-review" or "agent:design-review" in labels:
                 return await self.handle_architect_agent(repo_name, payload)
@@ -414,6 +414,14 @@ class EventRouter:
         elif event_name == "pull_request":
             added_label = payload.get("label", {}).get("name", "")
             pr_labels = [lbl.get("name", "") for lbl in payload.get("pull_request", {}).get("labels", [])]
+
+            # Remediation trigger when defects or changes are requested
+            if (
+                added_label in ["qa:failed", "status:changes-requested", "security:blocked", "needs-remediation", "agent:remediation", "ready-for-dev", "agent:ready-for-dev"]
+                or (action == "labeled" and added_label in ["qa:failed", "status:changes-requested", "security:blocked"])
+            ):
+                print(f"[EVENT ROUTER] 🧑‍💻 PR #{payload.get('pull_request', {}).get('number')} labeled with '{added_label}'. Routing to dev-agent for automated remediation...")
+                return await self.handle_dev_agent(repo_name, payload)
 
             if added_label == "ready-for-review" or "ready-for-review" in pr_labels:
                 return await self.handle_senior_reviewer_agent(repo_name, payload)
@@ -1048,10 +1056,11 @@ class EventRouter:
                 break
 
         if is_pr_remediation:
+            feedback_text = comment_body.strip() or review_history.strip() or "Please fix all failing tests, collection errors, and defects flagged in the latest QA/Review audit."
             user_input = (
                 f"{context_block}\n\n"
                 f"### ⚠️ Remediation Task for Pull Request #{pr_number}\n"
-                f"Latest Reviewer / QA Feedback:\n{comment_body}\n\n"
+                f"Latest Reviewer / QA Feedback:\n{feedback_text}\n\n"
                 f"You are in **PHASE 2: CODE IMPLEMENTATION**. Implement all required remediations adhering strictly to the directory layout, fix any test issues, and output all code blocks using ```python:backend/path/to/file.py or ```yaml:.github/workflows/file.yml."
             )
         else:
