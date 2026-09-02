@@ -5,6 +5,7 @@ Features 360-degree context awareness, dynamic file materialization, inter-agent
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -1063,15 +1064,20 @@ class EventRouter:
         # Check remote remediation loop count on PRs to prevent runaway webhook storms
         if is_pr_remediation and not self.dry_run and pr_number and repo:
             max_remote_remediations = int(os.getenv("MAX_REMOTE_REMEDIATIONS", "4"))
-            remed_count = review_history.count("dev-agent Remediation") + review_history.count("remediated_pr")
+            history_lower = review_history.lower()
+            remed_count = (
+                history_lower.count("dev-agent remediation")
+                + history_lower.count("remediation update")
+                + history_lower.count("remediated_pr")
+            )
             if remed_count >= max_remote_remediations:
                 print(f"[DEV-AGENT] 🛑 Remediation limit reached ({remed_count}/{max_remote_remediations}). Halting to prevent runaway CI.")
-                await self.github_client.add_labels(repo, pr_number, ["status:manual-intervention-required"])
+                await self._safe_add_labels(repo, pr_number, ["status:manual-intervention-required"])
                 await self.github_client.create_issue_comment(
                     repo,
                     pr_number,
                     f"## 🛑 Autonomous Remediation Budget Exceeded\n\n"
-                    f"`dev-agent` has completed **{max_remote_remediations} automated remediation runs** on this PR without passing all QA/Security gates.\n\n"
+                    f"`dev-agent` has completed **{remed_count} automated remediation runs** on this PR without passing all QA/Security gates.\n\n"
                     f"Execution has been paused with label `status:manual-intervention-required`. Please inspect the test logs and resolve any blocking defects.",
                 )
                 return {
