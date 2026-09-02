@@ -5,6 +5,7 @@ Features 360-degree context awareness, dynamic file materialization, inter-agent
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -500,6 +501,32 @@ class EventRouter:
             "status": "ignored",
             "reason": f"No agent trigger matched for event '{event_name}' (action: '{action}')",
         }
+
+    async def _safe_add_labels(self, repo: str, issue_number: int, labels: List[str]):
+        if not repo or not issue_number or self.dry_run:
+            return
+        try:
+            if hasattr(self.github_client, "add_labels"):
+                res = self.github_client.add_labels(repo, issue_number, labels)
+                if inspect.isawaitable(res):
+                    await res
+            elif hasattr(self.github_client, "add_issue_labels"):
+                res = self.github_client.add_issue_labels(repo, issue_number, labels)
+                if inspect.isawaitable(res):
+                    await res
+        except Exception as e:
+            print(f"[WARN] Failed adding labels {labels}: {e}")
+
+    async def _safe_remove_label(self, repo: str, issue_number: int, label: str):
+        if not repo or not issue_number or self.dry_run:
+            return
+        try:
+            if hasattr(self.github_client, "remove_label"):
+                res = self.github_client.remove_label(repo, issue_number, label)
+                if inspect.isawaitable(res):
+                    await res
+        except Exception:
+            pass
 
     async def _dispatch_agent(self, agent_name: str, repo: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized = agent_name.replace("-agent", "").lower()
@@ -1252,14 +1279,18 @@ class EventRouter:
                         f"Handoff target: `security-agent` & `qa-agent` for autonomous verification."
                     )
                     await self.github_client.create_issue_comment(repo, issue_number, issue_comment)
+                await self._safe_add_labels(repo, created_pr_number, ["ready-for-security-audit"])
             elif is_pr_remediation and created_pr_number:
                 # On PR remediation, comment on the PR with the updated files list
                 pr_remed_comment = (
                     f"## 🔄 `dev-agent` Remediation Update\n\n"
                     f"Pushed **{len(extracted_files)} updated file(s)** to branch `{branch_name}` addressing review findings.\n\n"
-                    f"Handoff target: `@qa-agent` / `@security-agent` for re-verification."
+                    f"Handoff target: `@qa-agent` for re-verification."
                 )
                 await self.github_client.create_issue_comment(repo, created_pr_number, pr_remed_comment)
+                for stale in ["qa:failed", "status:changes-requested", "security:blocked"]:
+                    await self._safe_remove_label(repo, created_pr_number, stale)
+                await self._safe_add_labels(repo, created_pr_number, ["ready-for-qa"])
 
         return {
             "agent": "dev-agent",
