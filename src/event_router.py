@@ -86,7 +86,7 @@ class AgentContextBuilder:
         # 2. Issue / Requirements Context
         issue_num = issue_info.get("number", 1)
         issue_title = issue_info.get("title", "Feature Request")
-        issue_body = issue_info.get("body", "(No description provided)")
+        issue_body = (issue_info.get("body") or "").strip() or "(No description provided - infer full requirements and Gherkin scenarios from the title and codebase architecture)"
         blocks.append(
             f"### 🎯 Specification & Requirements (Issue #{issue_num})\n"
             f"**Title**: {issue_title}\n"
