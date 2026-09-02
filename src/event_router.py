@@ -435,7 +435,11 @@ class EventRouter:
         slug = re.sub(r"[^a-z0-9]+", "-", issue_title.lower()).strip("-")[:30] or "feature"
         branch_name = f"feat/{issue_number}-{slug}"
 
-        # Detect existing PR
+        # Detect existing PR and branch directly from payload if available
+        pr_payload_obj = payload.get("pull_request", {})
+        if isinstance(pr_payload_obj, dict) and pr_payload_obj.get("head", {}).get("ref"):
+            branch_name = pr_payload_obj["head"]["ref"]
+
         pr_number = self._extract_pr_number(payload)
         pr_labels = []
         if not pr_number and not self.dry_run and repo:
