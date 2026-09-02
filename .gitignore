@@ -53,3 +53,8 @@ coverage.xml
 .env.local
 *.secret
 gcp-key.json
+
+# Local Test Sandbox Artifacts
+backend/
+docs/
+
