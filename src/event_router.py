@@ -1093,7 +1093,10 @@ class EventRouter:
                 f"{context_block}\n\n"
                 f"### ⚠️ Remediation Task for Pull Request #{pr_number}\n"
                 f"Latest Reviewer / QA Feedback:\n{feedback_text}\n\n"
-                f"You are in **PHASE 2: CODE IMPLEMENTATION**. Implement all required remediations adhering strictly to the directory layout, fix any test issues, and output all code blocks using ```python:backend/path/to/file.py or ```yaml:.github/workflows/file.yml."
+                f"You are in **PHASE 2: CODE IMPLEMENTATION**.\n"
+                f"1. Implement all required remediations adhering strictly to the directory layout.\n"
+                f"2. If you introduce or rely on third-party libraries (e.g. `PyJWT`, `email-validator` for `EmailStr`, `google-auth`, etc.), you MUST update `backend/requirements.txt` or repository dependency manifest.\n"
+                f"3. Output all code blocks using explicit paths: ```python:backend/path/to/file.py or ```text:backend/requirements.txt or ```yaml:.github/workflows/file.yml."
             )
         else:
             design_section = f"\n\n### 📐 Approved Technical Design Document:\n{design_content}\n" if design_content else ""
@@ -1103,8 +1106,9 @@ class EventRouter:
                 f"The Technical Design Document for Issue #{issue_number}: '{issue_title}' has been APPROVED by the Principal Architect.\n\n"
                 f"### YOUR MANDATORY ACTION:\n"
                 f"1. You MUST materialize and implement all actual source code files and unit/integration test files required for this feature.\n"
-                f"2. DO NOT output a design document, markdown proposal, or conversational chatter.\n"
-                f"3. Output complete, working code in explicit file blocks: ```python:backend/path/to/file.py or ```yaml:.github/workflows/file.yml."
+                f"2. If your implementation introduces new third-party imports (e.g. `PyJWT`, `email-validator`, `google-auth`), you MUST update `backend/requirements.txt` (or dependency manifest) in your output.\n"
+                f"3. DO NOT output a design document, markdown proposal, or conversational chatter.\n"
+                f"4. Output complete, working code in explicit file blocks: ```python:backend/path/to/file.py or ```text:backend/requirements.txt or ```yaml:.github/workflows/file.yml."
             )
 
         response = await self.llm_runner.generate_response(prompt, user_input, dry_run=self.dry_run, tier="fast")
@@ -1134,7 +1138,7 @@ class EventRouter:
                     f"You MUST generate the actual source code and test files now.\n"
                     f"Format each file strictly with its relative path in the code block header:\n"
                     f"```python:path/to/file.py\n# Code here\n```\n"
-                    f"or\n```yaml:.github/workflows/ci.yml\n# YAML here\n```"
+                    f"or\n```text:backend/requirements.txt\n# requirements here\n```"
                 )
                 retry_response = await self.llm_runner.generate_response(prompt, code_retry_input, dry_run=self.dry_run, tier="fast")
                 extracted_files = self._materialize_code_files(workspace_dir, retry_response)
@@ -1144,6 +1148,15 @@ class EventRouter:
                     break
 
             print(f"[DEV-AGENT] 🚀 Materialized {len(extracted_files)} files: {list(extracted_files.keys())}")
+
+            # Auto-install dependencies if manifest was created/updated
+            for filename in extracted_files.keys():
+                if "requirements.txt" in filename:
+                    print(f"[DEV-AGENT] 📦 Dependency manifest updated ({filename}). Installing in sandbox...")
+                    await self.test_harness.run_command(f"pip install -r {filename}")
+                elif "package.json" in filename:
+                    print(f"[DEV-AGENT] 📦 Node manifest updated ({filename}). Installing in sandbox...")
+                    await self.test_harness.run_command("npm install")
 
             # 3. Pre-Commit Self-Healing Sandbox Loop: verify locally before pushing!
             test_cmd = "pytest -v backend/tests" if ws_info.get("has_backend") else "pytest -v"
@@ -1158,16 +1171,31 @@ class EventRouter:
                     break
                 else:
                     print(f"[DEV-AGENT] ⚠️ Pre-commit test failure detected ({test_res.failed_tests} failed). Auto-remediating locally...")
+                    
+                    is_missing_dep = "ModuleNotFoundError" in test_res.failure_summary or "ImportError" in test_res.failure_summary
+                    dep_guidance = (
+                        "\n\n🚨 DEPENDENCY ERROR DETECTED: Missing third-party modules or uninstalled packages were detected during test collection.\n"
+                        "You MUST update `backend/requirements.txt` (or repository manifest) to declare the missing library (e.g. `PyJWT`, `email-validator`, etc.) AND ensure all imports in your code are correct.\n"
+                        if is_missing_dep else ""
+                    )
+
                     fix_input = (
                         f"Your previously generated code caused test failures or collection errors:\n\n"
                         f"### Test Command: {test_cmd}\n"
-                        f"### Error Traceback:\n```\n{test_res.failure_summary}\n```\n\n"
-                        f"Please fix all missing imports (e.g. from typing import AsyncGenerator, etc.), missing functions, and test errors.\n"
-                        f"Output all corrected files in ```python:backend/path/to/file.py blocks."
+                        f"### Error Traceback:\n```\n{test_res.failure_summary}\n```\n"
+                        f"{dep_guidance}\n"
+                        f"Please fix all missing imports (e.g. from typing import AsyncGenerator, etc.), missing functions, missing dependencies, and test errors.\n"
+                        f"Output all corrected files in ```python:backend/path/to/file.py or ```text:backend/requirements.txt blocks."
                     )
                     fix_response = await self.llm_runner.generate_response(prompt, fix_input, dry_run=self.dry_run, tier="fast")
                     re_extracted = self._materialize_code_files(workspace_dir, fix_response)
                     extracted_files.update(re_extracted)
+
+                    for fname in re_extracted.keys():
+                        if "requirements.txt" in fname:
+                            print(f"[DEV-AGENT] 📦 Dependency manifest updated during remediation ({fname}). Re-installing in sandbox...")
+                            await self.test_harness.run_command(f"pip install -r {fname}")
+
                     response += "\n\n" + fix_response
 
             commit_msg = (
