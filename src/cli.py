@@ -84,8 +84,9 @@ def _write_github_step_summary(result: Dict[str, Any], event_name: str, payload:
         print(f"[WARN] Failed writing GITHUB_STEP_SUMMARY: {e}")
 
 
-@app.command()
-def route(
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
     event_name: Optional[str] = typer.Option(
         None,
         "--event-name",
@@ -117,6 +118,8 @@ def route(
     ),
 ):
     """Route a GitHub action/webhook event to the appropriate autonomous agent."""
+    if ctx.invoked_subcommand is not None:
+        return
     resolved_event_name = event_name or os.getenv("GITHUB_EVENT_NAME") or "issues"
     resolved_event_path = event_path if event_path is not None else os.getenv("GITHUB_EVENT_PATH")
 
@@ -189,6 +192,67 @@ def route(
 
     console.print("\n[bold green]Execution Result:[/bold green]")
     console.print_json(json.dumps(result, indent=2))
+
+
+@app.command()
+def init(
+    target_dir: str = typer.Option(".", "--dir", "-d", help="Target repository directory to initialize"),
+):
+    """Auto-generate .github/workflows/agentic-sdlc.yml for instant onboarding."""
+    dest_dir = Path(target_dir).resolve() / ".github" / "workflows"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    workflow_path = dest_dir / "agentic-sdlc.yml"
+
+    workflow_content = """name: Autonomous Agentic SDLC
+
+on:
+  issues:
+    types: [opened, labeled]
+  issue_comment:
+    types: [created, edited]
+  pull_request:
+    types: [opened, synchronize, labeled]
+  pull_request_review:
+    types: [submitted, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  agentic-orchestrator:
+    name: "Autonomous SDLC Fleet"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Target Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Agentic Fleet Action
+        uses: dipeshsingh2012/agentic-fleet@v1
+        with:
+          gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
+          # Or OpenAI:
+          # openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          # Or Anthropic Claude:
+          # anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+"""
+    workflow_path.write_text(workflow_content, encoding="utf-8")
+    console.print(Panel(
+        f"[bold green]✅ Agentic Fleet initialized successfully![/bold green]\n\n"
+        f"📄 Created: [cyan]{workflow_path}[/cyan]\n\n"
+        f"[bold]Next Steps:[/bold]\n"
+        f"1. Add [yellow]GEMINI_API_KEY[/yellow] (or [yellow]OPENAI_API_KEY[/yellow]) to your repo secrets.\n"
+        f"2. Enable PR write permissions in Settings -> Actions -> General.\n"
+        f"3. Open an issue or comment [bold cyan]@fleet[/bold cyan] on any PR!",
+        title="🛸 Agentic Fleet Setup",
+    ))
 
 
 if __name__ == "__main__":

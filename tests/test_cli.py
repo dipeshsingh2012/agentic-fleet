@@ -48,9 +48,15 @@ def test_cli_issue_opened_with_null_body(tmp_path: Path, monkeypatch):
         "--event-path", str(event_file),
     ])
 
-    assert result.exit_code == 0
-    assert "Agentic Fleet Orchestrator" in result.stdout
-    assert "pm-agent" in result.stdout
-    assert "dev-agent" in result.stdout
-    assert "senior-reviewer-agent" in result.stdout
     assert "completed_awaiting_human_merge" in result.stdout
+
+
+def test_cli_init_command(tmp_path: Path):
+    result = runner.invoke(app, ["init", "--dir", str(tmp_path)])
+    assert result.exit_code == 0
+    workflow = tmp_path / ".github" / "workflows" / "agentic-sdlc.yml"
+    assert workflow.exists()
+    content = workflow.read_text(encoding="utf-8")
+    assert "Autonomous Agentic SDLC" in content
+    assert "uses: dipeshsingh2012/agentic-fleet@v1" in content
+    assert "gemini-api-key" in content

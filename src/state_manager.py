@@ -106,7 +106,7 @@ class StateManager:
         state.current_stage = f"{agent}:{action}"
         state.updated_at = time.time()
 
-        if action in ["remediated_pr", "remediation_update", "toggled_development"]:
+        if action in ["remediated_pr", "remediation_update"]:
             state.remediations_count += 1
 
         self._data.setdefault("prs", {})[key] = asdict(state)
