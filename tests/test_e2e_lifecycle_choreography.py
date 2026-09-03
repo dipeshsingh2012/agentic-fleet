@@ -262,10 +262,10 @@ async def test_e2e_security_defect_and_discrete_remediation(mock_repo_workspace:
         "label": {"name": "security:blocked"},
     }
     dev_remed_res = await router.route_event("pull_request", blocked_event_payload)
-    assert dev_remed_res["agent"] == "dev-agent"
-    assert dev_remed_res["action"] == "remediated_pr"
+    assert dev_remed_res["stages"]["dev_agent"]["agent"] == "dev-agent"
+    assert dev_remed_res["stages"]["dev_agent"]["action"] == "remediated_pr"
     mock_client.remove_label.assert_any_call("dipeshsingh2012/rfpengine", 10, "security:blocked")
-    mock_client.add_labels.assert_called_with("dipeshsingh2012/rfpengine", 10, ["ready-for-qa"])
+    mock_client.add_labels.assert_any_call("dipeshsingh2012/rfpengine", 10, ["ready-for-qa"])
 
 
 # ==============================================================================
@@ -318,10 +318,10 @@ async def test_e2e_qa_adversarial_failure_and_remediation(mock_repo_workspace: P
         "label": {"name": "qa:failed"},
     }
     dev_fix_res = await router.route_event("pull_request", qa_defect_payload)
-    assert dev_fix_res["agent"] == "dev-agent"
-    assert dev_fix_res["action"] == "remediated_pr"
+    assert dev_fix_res["stages"]["dev_agent"]["agent"] == "dev-agent"
+    assert dev_fix_res["stages"]["dev_agent"]["action"] == "remediated_pr"
     mock_client.remove_label.assert_any_call("dipeshsingh2012/rfpengine", 12, "qa:failed")
-    mock_client.add_labels.assert_called_with("dipeshsingh2012/rfpengine", 12, ["ready-for-qa"])
+    mock_client.add_labels.assert_any_call("dipeshsingh2012/rfpengine", 12, ["ready-for-qa"])
 
     # Step 3: QA re-run passes
     router.llm_runner.generate_response = AsyncMock(
@@ -383,8 +383,8 @@ async def test_e2e_senior_reviewer_changes_requested_and_approval(mock_repo_work
         },
     }
     dev_remed_res = await router.route_event("pull_request_review", bot_review_event)
-    assert dev_remed_res["agent"] == "dev-agent"
-    assert dev_remed_res["action"] == "remediated_pr"
+    assert dev_remed_res["stages"]["dev_agent"]["agent"] == "dev-agent"
+    assert dev_remed_res["stages"]["dev_agent"]["action"] == "remediated_pr"
 
     # Step 3: Final Approval
     router.llm_runner.generate_response = AsyncMock(
@@ -426,6 +426,6 @@ async def test_e2e_loop_budget_cap_protection(mock_repo_workspace: Path, monkeyp
     }
 
     result = await router.route_event("pull_request", payload)
-    assert result["agent"] == "dev-agent"
-    assert result["action"] == "halted_budget_exceeded"
+    assert result["stages"]["dev_agent"]["agent"] == "dev-agent"
+    assert result["stages"]["dev_agent"]["action"] == "halted_budget_exceeded"
     mock_client.add_labels.assert_called_with("dipeshsingh2012/rfpengine", 22, ["status:manual-intervention-required"])

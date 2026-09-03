@@ -52,7 +52,7 @@ async def test_reviewer_agents_pick_up_prior_review_history():
     workspace_info = {"has_backend": True, "detected_dirs": ["`backend/`"], "key_configs": []}
     issue_info = {"number": 20, "title": "Implement Webhook Verification"}
     pr_info = {"number": 22, "branch": "feat/20-webhook-verification", "diff": "+ def verify_signature(): ..."}
-    
+
     prior_reviews = (
         "### 📋 Prior Review & Audit History on this PR:\n"
         "#### 💬 Review by @security-agent (COMMENT):\n"
@@ -90,6 +90,8 @@ async def test_security_defects_handed_off_to_dev_for_remediation(tmp_path: Path
     router = EventRouter(dry_run=False, test_harness=harness)
     router.github_client = MagicMock()
     router.github_client.token = "test-token"
+    router.github_client.add_labels = AsyncMock()
+    router.github_client.remove_label = AsyncMock()
     router.github_client.get_pr_diff = AsyncMock(return_value="+ def query_all(): return db.query(TenantData).all()")
     router.github_client.get_pr_reviews = AsyncMock(return_value=[])
     router.github_client.get_issue_comments = AsyncMock(return_value=[])
@@ -124,8 +126,8 @@ async def test_security_defects_handed_off_to_dev_for_remediation(tmp_path: Path
     result = await router.route_event("pull_request_review_comment", payload)
 
     # Verify dev agent was invoked with the exact security defect context
-    assert result["agent"] == "dev-agent"
-    assert result["action"] == "remediated_pr"
+    assert result["stages"]["dev_agent"]["agent"] == "dev-agent"
+    assert result["stages"]["dev_agent"]["action"] == "remediated_pr"
     assert any("Missing `tenant_id` filter" in p for p in received_prompts)
 
 

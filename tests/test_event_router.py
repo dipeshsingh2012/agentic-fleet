@@ -1,4 +1,5 @@
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 from src.event_router import EventRouter
 
 
@@ -52,9 +53,10 @@ async def test_route_pr_opened_to_security():
         },
     }
     result = await router.route_event("pull_request", payload)
-    assert result["agent"] == "security-agent"
-    assert result["action"] == "security_audit"
-    assert result["pr_number"] == 20
+    assert result["pipeline"] == "autonomous-5-agent-sdlc"
+    assert result["stages"]["security_agent"]["agent"] == "security-agent"
+    assert result["stages"]["qa_agent"]["agent"] == "qa-agent"
+    assert result["stages"]["senior_reviewer_agent"]["agent"] == "senior-reviewer-agent"
 
 
 @pytest.mark.asyncio
@@ -70,8 +72,9 @@ async def test_route_pr_ready_for_qa():
         },
     }
     result = await router.route_event("pull_request", payload)
-    assert result["agent"] == "qa-agent"
-    assert result["action"] == "qa_verification"
+    assert result["pipeline"] == "autonomous-5-agent-sdlc"
+    assert result["stages"]["qa_agent"]["agent"] == "qa-agent"
+    assert result["stages"]["senior_reviewer_agent"]["agent"] == "senior-reviewer-agent"
 
 
 @pytest.mark.asyncio
@@ -87,8 +90,8 @@ async def test_route_pr_ready_for_review():
         },
     }
     result = await router.route_event("pull_request", payload)
-    assert result["agent"] == "senior-reviewer-agent"
-    assert result["action"] == "architect_review_approval"
+    assert result["pipeline"] == "autonomous-5-agent-sdlc"
+    assert result["stages"]["senior_reviewer_agent"]["agent"] == "senior-reviewer-agent"
 
 
 @pytest.mark.asyncio
@@ -182,8 +185,103 @@ async def test_route_review_failure_to_dev():
         "repository": {"full_name": "owner/repo"}
     }
     result = await router.route_event("pull_request_review", payload)
-    assert result["agent"] == "dev-agent"
-    assert result["action"] == "remediated_pr"
+    assert result["pipeline"] == "autonomous-5-agent-sdlc"
+    assert result["stages"]["dev_agent"]["agent"] == "dev-agent"
+    assert result["stages"]["security_agent"]["agent"] == "security-agent"
+    assert result["stages"]["qa_agent"]["agent"] == "qa-agent"
+    assert result["stages"]["senior_reviewer_agent"]["agent"] == "senior-reviewer-agent"
+
+
+@pytest.mark.asyncio
+async def test_comment_mentioning_dev_agent_cascades_to_full_pipeline():
+    router = EventRouter(dry_run=True)
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "owner/repo"},
+        "pull_request": {"number": 21, "head": {"ref": "feat/21-fix"}, "labels": [{"name": "qa:failed"}]},
+        "comment": {"body": "@dev-agent fix the issues raised by qa agent"},
+    }
+
+    result = await router.route_event("issue_comment", payload)
+
+    assert result["stages"]["dev_agent"]["action"] == "remediated_pr"
+    assert result["stages"]["security_agent"]["agent"] == "security-agent"
+    assert result["stages"]["qa_agent"]["agent"] == "qa-agent"
+    assert result["stages"]["senior_reviewer_agent"]["agent"] == "senior-reviewer-agent"
+
+
+@pytest.mark.asyncio
+async def test_comment_mentioning_qa_agent_cascades_to_senior_reviewer_on_pass():
+    router = EventRouter(dry_run=True)
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "owner/repo"},
+        "pull_request": {"number": 22, "head": {"ref": "feat/22-qa"}, "labels": []},
+        "comment": {"body": "@qa-agent verify"},
+    }
+
+    result = await router.route_event("issue_comment", payload)
+
+    assert result["stages"]["pm_agent"]["status"] == "skipped"
+    assert result["stages"]["dev_design"]["status"] == "skipped"
+    assert result["stages"]["dev_agent"]["status"] == "skipped"
+    assert result["stages"]["qa_agent"]["agent"] == "qa-agent"
+    assert result["stages"]["senior_reviewer_agent"]["agent"] == "senior-reviewer-agent"
+    assert result["status"] == "completed_awaiting_human_merge"
+
+
+@pytest.mark.asyncio
+async def test_pr_opened_event_cascades_through_security_qa_and_review():
+    router = EventRouter(dry_run=True)
+    payload = {
+        "action": "opened",
+        "repository": {"full_name": "owner/repo"},
+        "pull_request": {"number": 23, "head": {"ref": "feat/23-opened"}, "labels": []},
+    }
+
+    result = await router.route_event("pull_request", payload)
+
+    assert list(result["stages"]).index("security_agent") < list(result["stages"]).index("qa_agent")
+    assert list(result["stages"]).index("qa_agent") < list(result["stages"]).index("senior_reviewer_agent")
+    assert result["status"] == "completed_awaiting_human_merge"
+
+
+@pytest.mark.asyncio
+async def test_comment_mentioning_qa_agent_triggers_in_flight_dev_on_failure():
+    router = EventRouter(dry_run=False)
+    router._ensure_branch_checkout = AsyncMock()
+    router.github_client = MagicMock()
+    router.github_client.get_pull_request = AsyncMock(return_value={"head": {"ref": "feat/24-qa"}, "labels": []})
+    router.github_client.get_pull_request_files = AsyncMock(return_value=[{"filename": "app/main.py"}])
+    router.github_client.add_labels = AsyncMock()
+    router.github_client.create_issue_comment = AsyncMock()
+    router.github_client.get_pr_diff = AsyncMock(return_value="diff")
+    router.github_client.get_pr_reviews = AsyncMock(return_value=[])
+    router.github_client.get_issue_comments = AsyncMock(return_value=[])
+
+    qa_results = iter([
+        {"agent": "qa-agent", "action": "qa_verification", "response": "STATUS: FAILED ❌ test failure"},
+        {"agent": "qa-agent", "action": "qa_verification", "response": "STATUS: PASSED ✅"},
+    ])
+    router.handle_security_agent = AsyncMock(return_value={"agent": "security-agent", "action": "security_audit", "response": "STATUS: PASSED ✅"})
+    router.handle_qa_agent = AsyncMock(side_effect=lambda *args, **kwargs: next(qa_results))
+    router.handle_dev_agent = AsyncMock(return_value={"agent": "dev-agent", "action": "remediated_pr", "pr_number": 24, "branch_name": "feat/24-qa"})
+    router.handle_senior_reviewer_agent = AsyncMock(return_value={"agent": "senior-reviewer-agent", "action": "architect_review_approval", "verdict": "APPROVED"})
+
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "owner/repo"},
+        "pull_request": {"number": 24, "head": {"ref": "feat/24-qa"}, "labels": []},
+        "comment": {"body": "@qa-agent verify"},
+    }
+
+    result = await router.route_event("issue_comment", payload)
+
+    assert router.handle_dev_agent.await_count == 1
+    assert router.handle_qa_agent.await_count == 2
+    assert result["stages"]["dev_agent"]["agent"] == "dev-agent"
+    assert result["stages"]["senior_reviewer_agent"]["agent"] == "senior-reviewer-agent"
+    assert result["status"] == "completed_awaiting_human_merge"
 
 
 @pytest.mark.asyncio

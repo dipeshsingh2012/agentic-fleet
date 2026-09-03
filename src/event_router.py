@@ -391,7 +391,8 @@ class EventRouter:
         elif event_name in ["issue_comment", "pull_request_review_comment", "pull_request_review"] and action in ["created", "edited", "submitted"]:
             comment_obj = payload.get("comment", {}) or payload.get("review", {})
             author = comment_obj.get("user", {}).get("login", "")
-            
+            is_pr_comment = bool(payload.get("pull_request") or payload.get("issue", {}).get("pull_request"))
+
             # Avoid self-triggering infinite loops on bot comments, but allow formal bot reviews requesting changes
             is_bot = author.endswith("[bot]") or author in ["github-actions[bot]", "agentic-fleet"]
             review_state = (payload.get("review", {}).get("state") or "").lower()
@@ -416,6 +417,9 @@ class EventRouter:
                 )
 
             # 1. Pipeline trigger
+            if is_pr_comment:
+                # Keep every PR handoff in the same runner session.
+                return await self.run_autonomous_pipeline(repo_name, payload)
             if "@fleet" in comment_body or "@autonomous" in comment_body or "run pipeline" in comment_body:
                 return await self.run_autonomous_pipeline(repo_name, payload)
 
@@ -427,8 +431,8 @@ class EventRouter:
                 or "action required by dev-agent" in comment_body
                 or payload.get("review", {}).get("state") == "changes_requested"
             ):
-                print("[EVENT ROUTER] 🧑‍💻 Review reported defects / changes requested. Routing directly to dev-agent for remediation...")
-                return await self.handle_dev_agent(repo_name, payload)
+                print("[EVENT ROUTER] 🧑‍💻 Review reported defects / changes requested. Starting the in-process remediation pipeline...")
+                return await self.run_autonomous_pipeline(repo_name, payload)
 
             # 3. Explicit agent mentions (using word boundaries to prevent false substring matches)
             if re.search(r"@qa(-agent)?\b", comment_body):
@@ -454,6 +458,27 @@ class EventRouter:
         elif event_name == "pull_request":
             added_label = payload.get("label", {}).get("name", "")
             pr_labels = [lbl.get("name", "") for lbl in payload.get("pull_request", {}).get("labels", [])]
+
+            pipeline_labels = {
+                "ready-for-qa",
+                "ready-for-security-audit",
+                "ready-for-review",
+                "qa:failed",
+                "security:blocked",
+                "status:changes-requested",
+                "needs-remediation",
+                "agent:remediation",
+                "ready-for-dev",
+                "agent:ready-for-dev",
+            }
+            if action in ["opened", "synchronize", "labeled"] or added_label in pipeline_labels or any(label in pipeline_labels for label in pr_labels):
+                # Labels are state, not workflow triggers; continue all gates here.
+                pr_num = self._extract_pr_number(payload)
+                if action == "synchronize" and pr_num and not self.dry_run:
+                    stale_labels = ["ready-for-merge", "status:approved", "qa:passed", "security:passed", "qa:failed", "security:blocked", "status:changes-requested"]
+                    for stale in stale_labels:
+                        await self._safe_remove_label(repo_name, pr_num, stale)
+                return await self.run_autonomous_pipeline(repo_name, payload)
 
             # Invalidate stale approvals and run full pipeline on synchronize (new commits pushed)
             if action == "synchronize":
@@ -755,6 +780,12 @@ class EventRouter:
             payload.get("comment", {}).get("body", "")
             or payload.get("review", {}).get("body", "")
         ).lower()
+        is_qa_requested = bool(re.search(r"@qa(-agent)?\b", comment_body_text))
+        is_security_requested = bool(re.search(r"@security(-agent)?\b", comment_body_text))
+        is_review_defect = any(
+            marker in comment_body_text
+            for marker in ["status: failed", "status: blocked", "changes_requested", "action required"]
+        )
         is_dev_requested = any(
             k in comment_body_text
             for k in [
@@ -771,7 +802,7 @@ class EventRouter:
                 "address",
                 "patch",
             ]
-        )
+        ) or is_review_defect
         is_remediation_needed = any(
             l in pr_labels
             for l in [
@@ -783,7 +814,8 @@ class EventRouter:
                 "ready-for-dev",
                 "agent:ready-for-dev",
             ]
-        )
+        ) or is_review_defect
+        is_targeted_qa_only = is_qa_requested and not is_security_requested and not is_dev_requested and not is_remediation_needed
 
         # If PR already open, already has source files, and not explicitly requesting dev implementation, AND not in a defect/blocked state:
         if pr_number and has_source_files and not (is_comment_trigger and is_dev_requested) and not is_remediation_needed:
@@ -796,6 +828,9 @@ class EventRouter:
             pipeline_summary["stages"]["dev_agent"] = dev_result
             pr_number = dev_result.get("pr_number") or pr_number
             branch_name = dev_result.get("branch_name", branch_name)
+            if dev_result.get("action") == "halted_budget_exceeded":
+                pipeline_summary["status"] = "manual_intervention_required"
+                return pipeline_summary
 
         if not pr_number and not self.dry_run:
             print(f"\n[HALT] 🛑 dev-agent could not open a Pull Request for branch `{branch_name}`. Halting pipeline.")
@@ -832,7 +867,11 @@ class EventRouter:
         # -------------------------------------------------------------
         # STAGE 5: Security & Multi-Tenant Audit (security-agent Gate 2)
         # -------------------------------------------------------------
-        if "security:passed" in pr_labels and not self.dry_run:
+        if is_targeted_qa_only:
+            print("[STAGE 5/6] ⏭️ security-agent: Targeted QA verification requested. Skipping duplicate security audit.")
+            pipeline_summary["stages"]["security_agent"] = {"status": "skipped", "reason": "targeted_qa_verification"}
+            is_sec_blocked = False
+        elif "security:passed" in pr_labels and not self.dry_run and not is_security_requested:
             print(f"[STAGE 5/6] ⏭️ security-agent: Multi-tenant audit already passed (security:passed). Skipping duplicate review.")
             pipeline_summary["stages"]["security_agent"] = {"status": "skipped", "verdict": "PASSED"}
             is_sec_blocked = False
@@ -871,7 +910,7 @@ class EventRouter:
         # -------------------------------------------------------------
         # STAGE 5b: Adversarial QA & Test Execution (qa-agent Gate 3)
         # -------------------------------------------------------------
-        if "qa:passed" in pr_labels and not self.dry_run and not is_sec_blocked:
+        if "qa:passed" in pr_labels and not self.dry_run and not is_sec_blocked and not is_qa_requested:
             print(f"[STAGE 5.3] ⏭️ qa-agent: QA verification already passed (qa:passed). Skipping duplicate review.")
             pipeline_summary["stages"]["qa_agent"] = {"status": "skipped", "verdict": "PASSED"}
             is_qa_failed = False
@@ -1327,7 +1366,7 @@ class EventRouter:
                     break
                 else:
                     print(f"[DEV-AGENT] ⚠️ Pre-commit test failure detected ({test_res.failed_tests} failed). Auto-remediating locally...")
-                    
+
                     is_missing_dep = "ModuleNotFoundError" in test_res.failure_summary or "ImportError" in test_res.failure_summary
                     dep_guidance = (
                         "\n\n🚨 DEPENDENCY ERROR DETECTED: Missing third-party modules or uninstalled packages were detected during test collection.\n"
@@ -1432,7 +1471,7 @@ class EventRouter:
                 # On PR remediation, post a detailed summary of changes, pre-commit test status, and telemetry
                 file_list_md = "\n".join([f"- `{f}`" for f in extracted_files.keys()]) or "- Direct code patch (no new files created)"
                 telemetry_str = self.state_manager.get_telemetry_summary(repo, created_pr_number)
-                
+
                 pr_remed_comment = (
                     f"## 🔄 `dev-agent` Remediation Summary\n\n"
                     f"### 📋 Materialized Changes\n"
