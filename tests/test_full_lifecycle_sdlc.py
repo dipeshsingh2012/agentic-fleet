@@ -408,3 +408,80 @@ async def test_autonomous_pipeline_remediates_when_pr_blocked_by_security(tmp_pa
     assert stages["senior_reviewer_agent"]["agent"] == "senior-reviewer-agent"
 
 
+@pytest.mark.asyncio
+async def test_autonomous_pipeline_in_flight_qa_self_healing(tmp_path: Path):
+    """
+    Validates that when qa-agent reports test failures during run_autonomous_pipeline,
+    the pipeline does not halt immediately; it autonomously triggers dev-agent
+    to remediate the QA failures in-flight, re-runs qa-agent, and proceeds to
+    senior reviewer sign-off once green.
+    """
+    import os
+    os.environ["FLEET_STATE_FILE"] = str(tmp_path / ".test_state.json")
+    os.environ["TARGET_WORKSPACE"] = str(tmp_path)
+
+    harness = MagicMock(spec=TestHarness)
+    harness.cwd = str(tmp_path)
+    harness.run_command = AsyncMock(return_value=TestResult(command="", exit_code=0, duration_seconds=0.1, stdout="ok", stderr=""))
+    (tmp_path / "backend" / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "backend" / "app" / "core").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "backend" / "app" / "core" / "config.py").write_text("settings = {}\n")
+
+    router = EventRouter(dry_run=False, test_harness=harness)
+    mock_client = create_mock_github_client()
+    router.github_client = mock_client
+
+    responses = [
+        # 1. security-agent audit passes
+        "STATUS: PASSED ✅ Multi-tenant isolation verified.",
+        # 2. qa-agent audit 1 fails (missing get_settings)
+        "STATUS: FAILED ❌ ImportError: cannot import name 'get_settings' from 'app.core.config'",
+        # 3. dev-agent remediation runs and patches config.py
+        "```python:backend/app/core/config.py\ndef get_settings(): return {}\n```",
+        # 4. qa-agent audit 2 passes
+        "STATUS: PASSED ✅ 100% test pass rate.",
+        # 5. security-agent re-audit after QA remediation passes
+        "STATUS: PASSED ✅ Security invariants intact.",
+        # 6. senior-reviewer-agent approves
+        "STATUS: APPROVED LGTM ✅ Ready for merge.",
+    ]
+    response_iter = iter(responses)
+
+    async def mock_generate_response(*args, **kwargs):
+        try:
+            return next(response_iter)
+        except StopIteration:
+            return "STATUS: PASSED ✅"
+
+    router.llm_runner.generate_response = AsyncMock(side_effect=mock_generate_response)
+
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "dipeshsingh2012/rfpengine"},
+        "issue": {
+            "number": 14,
+            "title": "Fix SSO Configuration",
+            "body": "Ensure conftest can import get_settings.",
+            "labels": [{"name": "ready-for-qa"}],
+            "pull_request": {"url": "https://api.github.com/repos/dipeshsingh2012/rfpengine/pulls/14"},
+        },
+        "pull_request": {
+            "number": 14,
+            "head": {"ref": "feat/13-implement-google-sso"},
+            "labels": [{"name": "ready-for-qa"}],
+        },
+    }
+
+    result = await router.run_autonomous_pipeline("dipeshsingh2012/rfpengine", payload)
+
+    assert result["pipeline"] == "autonomous-5-agent-sdlc"
+    assert result["status"] == "completed_awaiting_human_merge"
+
+    stages = result["stages"]
+    assert stages["qa_agent"]["agent"] == "qa-agent"
+    assert "PASSED" in stages["qa_agent"]["response"]
+    assert stages["dev_agent"]["agent"] == "dev-agent"
+    assert stages["senior_reviewer_agent"]["agent"] == "senior-reviewer-agent"
+
+
+

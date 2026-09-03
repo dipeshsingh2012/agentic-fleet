@@ -576,6 +576,7 @@ class EventRouter:
         issue_payload = payload.get("issue", {})
         issue_number = issue_payload.get("number", 1)
         issue_title = issue_payload.get("title", "Feature Request")
+        issue_body = issue_payload.get("body", "") or ""
         issue_labels = [lbl.get("name", "") for lbl in issue_payload.get("labels", [])]
 
         slug = re.sub(r"[^a-z0-9]+", "-", issue_title.lower()).strip("-")[:30] or "feature"
@@ -819,7 +820,7 @@ class EventRouter:
         pr_payload = {
             "repository": {"full_name": repo},
             "pull_request": {"number": effective_pr_number, "head": {"ref": branch_name}},
-            "issue": {"number": effective_pr_number, "pull_request": {}},
+            "issue": {"number": effective_pr_number, "title": issue_title, "body": issue_body, "pull_request": {}},
         }
 
         # If dev-agent just ran remediation or triggered by a comment, reset stale status flags to evaluate clean diff
@@ -843,6 +844,25 @@ class EventRouter:
             sec_response = sec_result.get("response", "")
             is_sec_blocked = False if self.dry_run else ("STATUS: BLOCKED" in sec_response or "VERDICT: BLOCKED" in sec_response or "STATUS: FAILED" in sec_response)
 
+            # In-Flight Security Self-Healing Loop
+            sec_remediations = 0
+            MAX_SEC_REMEDIATIONS = 2
+            while is_sec_blocked and sec_remediations < MAX_SEC_REMEDIATIONS and not self.dry_run:
+                sec_remediations += 1
+                print(f"\n[SELF-HEAL] 🛡️ In-Flight Security Remediation Loop (Attempt {sec_remediations}/{MAX_SEC_REMEDIATIONS})...")
+                dev_payload = dict(pr_payload)
+                dev_payload["comment"] = {"body": f"Remediate security audit defects:\n{sec_response}"}
+                dev_result = await self.handle_dev_agent(repo, dev_payload)
+                pipeline_summary["stages"]["dev_agent"] = dev_result
+                if dev_result.get("action") == "halted_budget_exceeded":
+                    break
+
+                # Re-audit with security-agent
+                sec_result = await self.handle_security_agent(repo, pr_payload)
+                pipeline_summary["stages"]["security_agent"] = sec_result
+                sec_response = sec_result.get("response", "")
+                is_sec_blocked = ("STATUS: BLOCKED" in sec_response or "VERDICT: BLOCKED" in sec_response or "STATUS: FAILED" in sec_response)
+
             if is_sec_blocked:
                 print("\n[HALT] 🛑 Security defects detected. Halting pipeline to allow discrete dev-agent remediation.")
                 pipeline_summary["status"] = "security_blocked_halted"
@@ -863,10 +883,41 @@ class EventRouter:
             qa_response = qa_result.get("response", "")
             is_qa_failed = False if self.dry_run else ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
 
+            # In-Flight QA Self-Healing Loop
+            qa_remediations = 0
+            MAX_QA_REMEDIATIONS = 2
+            while is_qa_failed and qa_remediations < MAX_QA_REMEDIATIONS and not self.dry_run:
+                qa_remediations += 1
+                print(f"\n[SELF-HEAL] 🧪 In-Flight QA Remediation Loop (Attempt {qa_remediations}/{MAX_QA_REMEDIATIONS})...")
+                dev_payload = dict(pr_payload)
+                dev_payload["comment"] = {"body": f"Remediate QA test failures and errors:\n{qa_response}"}
+                dev_result = await self.handle_dev_agent(repo, dev_payload)
+                pipeline_summary["stages"]["dev_agent"] = dev_result
+                if dev_result.get("action") == "halted_budget_exceeded":
+                    break
+
+                # Re-verify with qa-agent
+                qa_result = await self.handle_qa_agent(repo, pr_payload)
+                pipeline_summary["stages"]["qa_agent"] = qa_result
+                qa_response = qa_result.get("response", "")
+                is_qa_failed = ("STATUS: FAILED" in qa_response or "FAILED ❌" in qa_response or "VERDICT: FAILED" in qa_response)
+
             if is_qa_failed:
                 print("\n[HALT] 🛑 QA verification failed. Halting pipeline to allow discrete dev-agent remediation.")
                 pipeline_summary["status"] = "qa_failed_halted"
                 return pipeline_summary
+
+            # If QA remediated code, re-audit security invariants once to verify no security regressions
+            if qa_remediations > 0 and not is_qa_failed and not self.dry_run:
+                print(f"\n[STAGE 5/6] 🛡️ Re-auditing security invariants after QA remediation...")
+                sec_result = await self.handle_security_agent(repo, pr_payload)
+                pipeline_summary["stages"]["security_agent"] = sec_result
+                sec_response = sec_result.get("response", "")
+                is_sec_blocked = ("STATUS: BLOCKED" in sec_response or "VERDICT: BLOCKED" in sec_response or "STATUS: FAILED" in sec_response)
+                if is_sec_blocked:
+                    print("\n[HALT] 🛑 Security regression detected during QA remediation.")
+                    pipeline_summary["status"] = "security_blocked_halted"
+                    return pipeline_summary
 
         # -------------------------------------------------------------
         # STAGE 6: Principal Architect Review & Sign-off (senior-reviewer-agent)
