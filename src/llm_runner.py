@@ -9,7 +9,6 @@ Features Multi-Model Tiering (Fast vs Deep) and automatic cross-provider failove
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -115,26 +114,33 @@ class LLMRunner:
         if dry_run:
             return f"[DRY RUN / MOCK MODE] Generated response for input:\n{prompt_text}"
 
-        # Dispatch to provider
-        if self.provider == "anthropic" or (self.anthropic_api_key and not self.gemini_api_key):
-            try:
-                return await self._generate_anthropic(system_instruction, prompt_text)
-            except Exception as e:
-                logger.warning(f"Anthropic generation failed: {e}")
+        provider_generators = {
+            "gemini": lambda: self._generate_gemini(system_instruction, prompt_text, dry_run=dry_run, tier=tier),
+            "openai": lambda: self._generate_openai(system_instruction, prompt_text),
+            "anthropic": lambda: self._generate_anthropic(system_instruction, prompt_text),
+            "ollama": lambda: self._generate_ollama(system_instruction, prompt_text),
+        }
+        configured = {
+            "gemini": bool(self.gemini_api_key),
+            "openai": bool(self.openai_api_key),
+            "anthropic": bool(self.anthropic_api_key),
+            "ollama": bool(self.ollama_host),
+        }
+        provider_order = [self.provider] + [name for name, enabled in configured.items() if enabled and name != self.provider]
+        last_error: Optional[Exception] = None
 
-        if self.provider == "openai" or (self.openai_api_key and not self.gemini_api_key):
+        for provider in provider_order:
+            generator = provider_generators.get(provider)
+            if not generator or (provider != "gemini" and not configured[provider]):
+                continue
             try:
-                return await self._generate_openai(system_instruction, prompt_text)
-            except Exception as e:
-                logger.warning(f"OpenAI generation failed: {e}")
+                return await generator()
+            except Exception as exc:
+                last_error = exc
+                logger.warning("%s generation failed; trying next configured provider: %s", provider, exc)
 
-        if self.provider == "ollama":
-            try:
-                return await self._generate_ollama(system_instruction, prompt_text)
-            except Exception as e:
-                logger.warning(f"Ollama generation failed: {e}")
-
-        # Default / Fallback: Google Gemini
+        if last_error:
+            raise RuntimeError(f"All configured LLM providers failed. Last error: {last_error}") from last_error
         return await self._generate_gemini(system_instruction, prompt_text, dry_run=dry_run, tier=tier)
 
     def _get_gemini_candidate_models(self, tier: str = "fast") -> List[str]:
@@ -216,8 +222,6 @@ class LLMRunner:
                 except Exception as e:
                     last_error = e
                     print(f"[LLM:Gemini] ⚠️ Model {model_name} (SDK) failed: {e}")
-                    if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                        await asyncio.sleep(2)
 
             # 2. Try Gemini REST API
             if self.gemini_api_key:
@@ -241,8 +245,6 @@ class LLMRunner:
                         else:
                             last_error = f"HTTP {resp.status_code}: {resp.text}"
                             print(f"[LLM:Gemini-REST] ⚠️ Model {model_name} (REST) failed with HTTP {resp.status_code}: {resp.text[:120]}")
-                            if resp.status_code == 429:
-                                await asyncio.sleep(2)
                 except Exception as e:
                     last_error = e
                     print(f"[LLM:Gemini-REST] ⚠️ REST request for {model_name} failed: {e}")

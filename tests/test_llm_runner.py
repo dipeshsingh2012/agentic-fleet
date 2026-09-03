@@ -1,5 +1,6 @@
 import pytest
 from pathlib import Path
+from unittest.mock import AsyncMock
 from src.llm_runner import LLMRunner
 
 
@@ -31,3 +32,18 @@ async def test_generate_response_dry_run():
     )
     assert "DRY RUN" in response
     assert "Format issue #12" in response
+
+
+@pytest.mark.asyncio
+async def test_gemini_quota_fails_over_to_configured_provider():
+    runner = LLMRunner(provider="gemini")
+    runner.gemini_api_key = "gemini-key"
+    runner.openai_api_key = "openai-key"
+    runner._generate_gemini = AsyncMock(side_effect=RuntimeError("429 RESOURCE_EXHAUSTED quota exceeded"))
+    runner._generate_openai = AsyncMock(return_value="OpenAI fallback response")
+
+    response = await runner.generate_response("system", "input")
+
+    assert response == "OpenAI fallback response"
+    runner._generate_gemini.assert_awaited_once()
+    runner._generate_openai.assert_awaited_once()
