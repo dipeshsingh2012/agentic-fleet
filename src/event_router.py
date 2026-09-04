@@ -50,11 +50,27 @@ class AgentContextBuilder:
             if (workspace_dir / config_name).exists() or (workspace_dir / "backend" / config_name).exists():
                 key_configs.append(config_name)
 
+        existing_manifests: Dict[str, str] = {}
+        for req_name in ["requirements.txt", "backend/requirements.txt"]:
+            req_file = workspace_dir / req_name
+            if req_file.exists():
+                try:
+                    lines = [
+                        l.strip()
+                        for l in req_file.read_text(encoding="utf-8").splitlines()
+                        if l.strip() and not l.startswith("#")
+                    ]
+                    if lines:
+                        existing_manifests[req_name] = ", ".join(lines[:30])
+                except Exception:
+                    pass
+
         return {
             "has_backend": has_backend,
             "has_frontend": has_frontend,
             "detected_dirs": detected_dirs,
             "key_configs": key_configs,
+            "existing_manifests": existing_manifests,
         }
 
     @staticmethod
@@ -86,6 +102,16 @@ class AgentContextBuilder:
             f"- **Configuration Files**: {configs_str}\n"
             f"- **Layout Contract**: {path_directive}"
         )
+
+        manifests = workspace_info.get("existing_manifests", {})
+        if manifests:
+            manifest_lines = "\n".join(f"  - `{k}`: {v}" for k, v in manifests.items())
+            blocks.append(
+                f"### 📦 Active Project Dependencies (MUST PRESERVE)\n"
+                f"{manifest_lines}\n"
+                f"⚠️ **GUARD**: You MUST preserve all existing dependencies when updating manifests. "
+                f"Never delete production libraries when adding test or new feature packages."
+            )
 
         # 2. Issue / Requirements Context
         issue_num = issue_info.get("number", 1)
@@ -161,6 +187,72 @@ class EventRouter:
             return issue.get("number")
         return None
 
+    @staticmethod
+    def _merge_requirements_txt(existing_text: str, new_text: str) -> str:
+        """Merge newly generated requirements.txt with existing requirements.txt.
+        Preserves all existing packages while adding new packages or updating versions.
+        """
+        def _parse_reqs(text: str) -> Dict[str, str]:
+            reqs = {}
+            for line in text.splitlines():
+                clean = line.strip()
+                if not clean or clean.startswith("#"):
+                    continue
+                m = re.match(r"^([a-zA-Z0-9_\-\.]+)(?:\[[^\]]*\])?(.*)$", clean)
+                if m:
+                    reqs[m.group(1).lower()] = clean
+                else:
+                    reqs[clean.lower()] = clean
+            return reqs
+
+        new_dict = _parse_reqs(new_text)
+        result_lines = []
+        seen = set()
+
+        for line in existing_text.splitlines():
+            clean = line.strip()
+            if not clean or clean.startswith("#"):
+                result_lines.append(line)
+                continue
+            m = re.match(r"^([a-zA-Z0-9_\-\.]+)(?:\[[^\]]*\])?(.*)$", clean)
+            if m:
+                pkg_key = m.group(1).lower()
+                if pkg_key in new_dict:
+                    result_lines.append(new_dict.pop(pkg_key))
+                    seen.add(pkg_key)
+                else:
+                    result_lines.append(line)
+                    seen.add(pkg_key)
+            else:
+                result_lines.append(line)
+
+        for pkg_key, new_line in new_dict.items():
+            if pkg_key not in seen:
+                result_lines.append(new_line)
+
+        return "\n".join(result_lines) + "\n"
+
+    @staticmethod
+    def _merge_package_json(existing_text: str, new_text: str) -> str:
+        """Merge newly generated package.json with existing package.json.
+        Preserves all existing dependencies and devDependencies.
+        """
+        try:
+            existing_json = json.loads(existing_text)
+            new_json = json.loads(new_text)
+            for dep_type in ["dependencies", "devDependencies", "peerDependencies"]:
+                if dep_type in new_json and isinstance(new_json[dep_type], dict):
+                    if dep_type not in existing_json or not isinstance(existing_json[dep_type], dict):
+                        existing_json[dep_type] = {}
+                    existing_json[dep_type].update(new_json[dep_type])
+            if "scripts" in new_json and isinstance(new_json["scripts"], dict):
+                if "scripts" not in existing_json or not isinstance(existing_json["scripts"], dict):
+                    existing_json["scripts"] = {}
+                existing_json["scripts"].update(new_json["scripts"])
+            return json.dumps(existing_json, indent=2) + "\n"
+        except Exception:
+            return new_text.strip() + "\n"
+
     def _materialize_code_files(self, workspace_dir: Path, content: str) -> Dict[str, str]:
         """Extract and write all source and test code blocks into real repository files with language-aware package markers."""
         files: Dict[str, str] = {}
@@ -205,9 +297,26 @@ class EventRouter:
                 continue
 
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_text(file_code.strip() + "\n", encoding="utf-8")
-            materialized[target_rel] = file_code
-            print(f"[DEV-AGENT] 📝 Materialized file ({len(file_code)} chars): {target_rel}")
+            final_content = file_code.strip() + "\n"
+            if target_path.exists():
+                if target_rel.endswith("requirements.txt"):
+                    try:
+                        existing_text = target_path.read_text(encoding="utf-8")
+                        final_content = self._merge_requirements_txt(existing_text, file_code)
+                        print(f"[DEV-AGENT] 🛡️ Merged dependency manifest with existing packages: {target_rel}")
+                    except Exception as e:
+                        print(f"[WARN] Failed to merge requirements.txt, writing directly: {e}")
+                elif target_rel.endswith("package.json"):
+                    try:
+                        existing_text = target_path.read_text(encoding="utf-8")
+                        final_content = self._merge_package_json(existing_text, file_code)
+                        print(f"[DEV-AGENT] 🛡️ Merged package.json dependencies with existing config: {target_rel}")
+                    except Exception as e:
+                        print(f"[WARN] Failed to merge package.json, writing directly: {e}")
+
+            target_path.write_text(final_content, encoding="utf-8")
+            materialized[target_rel] = final_content
+            print(f"[DEV-AGENT] 📝 Materialized file ({len(final_content)} chars): {target_rel}")
 
             # Ensure parent Python directories contain __init__.py only for Python projects
             if profile.package_markers_needed and target_rel.endswith(".py"):
