@@ -1462,16 +1462,25 @@ class EventRouter:
                     print(f"[DEV-AGENT] 📦 Node manifest updated ({filename}). Installing in sandbox...")
                     await self.test_harness.run_command("npm install")
 
+            # Ensure workspace environment dependencies are installed
+            if profile.install_command:
+                print(f"[DEV-AGENT] 📦 Ensuring environment dependencies installed via `{profile.install_command}`...")
+                await self.test_harness.run_command(profile.install_command)
+
             # 3. Pre-Commit Self-Healing Sandbox Loop: verify locally before pushing!
             test_cmd = profile.test_command
             max_remediations = int(os.getenv("MAX_REMEDIATION_ITERATIONS", "5"))
             actual_iterations = 1
+            test_res = None
             for iteration in range(1, max_remediations + 1):
                 actual_iterations = iteration
                 print(f"[DEV-AGENT] 🧪 Running pre-commit test verification (Iteration {iteration}/{max_remediations}) using `{test_cmd}`...")
                 test_res = await self.test_harness.run_command(test_cmd)
-                if test_res.is_success or test_res.failed_tests == 0:
+                if test_res.is_success and test_res.total_tests > 0:
                     print(f"[DEV-AGENT] ✅ Pre-commit test suite PASSED ({test_res.passed_tests} passed, 0 failures)!")
+                    break
+                elif test_res.is_success:
+                    print(f"[DEV-AGENT] ✅ Pre-commit test command succeeded with exit code 0!")
                     break
                 else:
                     print(f"[DEV-AGENT] ⚠️ Pre-commit test failure detected ({test_res.failed_tests} failed). Auto-remediating locally...")
@@ -1501,6 +1510,26 @@ class EventRouter:
                             await self.test_harness.run_command(f"pip install -r {fname}")
 
                     response += "\n\n" + fix_response
+
+            # Safety Gate: Abort push on PR remediation if pre-commit verification failed to prevent regressing remote PR
+            if is_pr_remediation and test_res and not test_res.is_success and not self.dry_run:
+                print(f"[DEV-AGENT] ❌ Pre-commit test suite failed after {actual_iterations} iterations ({test_res.failed_tests} failed). Aborting push to prevent regressing PR #{effective_num}!")
+                if is_pr_remediation and created_pr_number:
+                    halt_msg = (
+                        f"⚠️ **Dev Agent Pre-Commit Verification Halted**\n\n"
+                        f"The automated self-healing loop was unable to resolve all test failures locally after {actual_iterations} iterations.\n"
+                        f"To prevent regressing the PR branch, pushing commits has been suspended.\n\n"
+                        f"**Failing Command**: `{test_cmd}`\n"
+                        f"**Failure Summary**:\n```\n{test_res.failure_summary[:1500]}\n```"
+                    )
+                    await self.github_client.create_issue_comment(repo, created_pr_number, halt_msg)
+                return {
+                    "agent": "dev-agent",
+                    "action": "precommit_verification_failed",
+                    "pr_number": effective_num,
+                    "branch_name": branch_name,
+                    "error": f"Pre-commit tests failed after {actual_iterations} iterations",
+                }
 
             commit_msg = (
                 f"fix(sdlc): remediate review findings and materialize source files on PR #{pr_number}"
@@ -1715,8 +1744,11 @@ class EventRouter:
         diff_content = await self._get_pr_diff_safe(repo, effective_pr_number)
         review_history = await self._get_pr_reviews_summary(repo, effective_pr_number)
 
-        # Smart test execution: if backend/ directory exists, run pytest inside backend or target backend/tests
-        test_cmd = "pytest -v backend/tests" if ws_info.get("has_backend") else "pytest -v"
+        # Smart test execution: use WorkspaceInspector profile to ensure 100% parity with dev-agent
+        profile = WorkspaceInspector.inspect(workspace_dir)
+        test_cmd = profile.test_command
+        if profile.install_command and not self.dry_run:
+            await self.test_harness.run_command(profile.install_command)
 
         test_res = await self.test_harness.run_command(test_cmd) if not self.dry_run else None
         if test_res:
