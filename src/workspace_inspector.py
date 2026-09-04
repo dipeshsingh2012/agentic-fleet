@@ -132,13 +132,13 @@ class WorkspaceInspector:
             if "test:" in taskfile_content and shutil.which("task"):
                 return "task test"
 
-        if "rust" in profile.detected_languages:
+        if profile.primary_language == "rust":
             return "cargo test"
 
-        if "go" in profile.detected_languages:
+        if profile.primary_language == "go":
             return "go test ./..."
 
-        if "typescript" in profile.detected_languages or "javascript" in profile.detected_languages:
+        if profile.primary_language in ["typescript", "javascript"]:
             pkg_path = workspace_dir / "package.json"
             if pkg_path.exists():
                 try:
@@ -150,7 +150,7 @@ class WorkspaceInspector:
                     pass
             return "npm test"
 
-        if "java" in profile.detected_languages:
+        if profile.primary_language == "java":
             if (workspace_dir / "pom.xml").exists():
                 return "mvn test"
             if (workspace_dir / "build.gradle").exists():
